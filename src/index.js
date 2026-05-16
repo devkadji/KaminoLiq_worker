@@ -82,6 +82,68 @@ function formatTable(data) {
   return lines.join('\n');
 }
 
+// --- Subscribers ----------------------------------------------------------
+// Public subscribe model: anyone who /starts the bot gets future alerts.
+// /stop removes them. The owner (env.TELEGRAM_CHAT_ID) is always a recipient
+// regardless of the list, as a safety net.
+
+async function getSubscribers(env) {
+  const arr = (await env.STATE.get('subscribers', 'json')) || [];
+  return new Set(arr.map(Number));
+}
+
+async function saveSubscribers(env, set) {
+  await env.STATE.put('subscribers', JSON.stringify([...set]));
+}
+
+async function addSubscriber(env, chatId) {
+  const subs = await getSubscribers(env);
+  if (subs.has(chatId)) return false;
+  subs.add(chatId);
+  await saveSubscribers(env, subs);
+  return true;
+}
+
+async function removeSubscriber(env, chatId) {
+  const subs = await getSubscribers(env);
+  if (!subs.has(chatId)) return false;
+  subs.delete(chatId);
+  await saveSubscribers(env, subs);
+  return true;
+}
+
+// Send the same payload to every subscriber + the owner. If anyone has blocked
+// the bot or has an invalid chat, drop them from the subscriber list silently.
+async function broadcast(env, payload) {
+  const owner = Number(env.TELEGRAM_CHAT_ID);
+  const subs = await getSubscribers(env);
+  const recipients = new Set([...subs, owner]);
+  const blocked = [];
+
+  await Promise.all(
+    [...recipients].map(async (chat_id) => {
+      try {
+        await tg(env, { ...payload, chat_id });
+      } catch (err) {
+        const msg = String(err.message || '');
+        // 403 = bot blocked by user; 400 chat not found = chat deleted/inaccessible.
+        if (msg.includes(' 403') || msg.includes('bot was blocked') || msg.includes('chat not found')) {
+          if (chat_id !== owner) blocked.push(chat_id);
+          console.log(`drop unreachable chat ${chat_id}: ${msg}`);
+        } else {
+          console.error(`send to ${chat_id} failed: ${msg}`);
+        }
+      }
+    }),
+  );
+
+  if (blocked.length) {
+    const subs2 = await getSubscribers(env);
+    for (const id of blocked) subs2.delete(id);
+    await saveSubscribers(env, subs2);
+  }
+}
+
 async function handleScheduled(env) {
   const data = await fetchLiquidity();
   const prev = (await env.STATE.get('state', 'json')) || {};
@@ -96,8 +158,7 @@ async function handleScheduled(env) {
       checkedAt: new Date().toISOString(),
     };
     if (isOpen && !wasOpen) {
-      await tg(env, {
-        chat_id: env.TELEGRAM_CHAT_ID,
+      await broadcast(env, {
         text:
           `🟢 <b>${p.name}</b>\n` +
           `Borrow liquidity is now <b>available</b>: <b>${fmt(p.available)} ${p.symbol}</b>\n` +
@@ -108,8 +169,7 @@ async function handleScheduled(env) {
         reply_markup: INLINE_KEYBOARD,
       });
     } else if (!isOpen && wasOpen) {
-      await tg(env, {
-        chat_id: env.TELEGRAM_CHAT_ID,
+      await broadcast(env, {
         text:
           `🔴 <b>${p.name}</b>\n` +
           `Borrow liquidity is closed again (utilization ${(p.utilization * 100).toFixed(2)}%).`,
@@ -149,16 +209,48 @@ async function handleWebhook(request, env) {
   // Text commands
   if (update.message?.text) {
     const text = update.message.text.trim();
-    if (text === '/start' || text === '/check') {
+    const chatId = update.message.chat.id;
+    const owner = Number(env.TELEGRAM_CHAT_ID);
+
+    if (text === '/start') {
+      const added = await addSubscriber(env, chatId);
       const data = await fetchLiquidity();
+      const intro = added
+        ? "👋 Subscribed! You'll get a ping when borrow liquidity opens up.\n" +
+          'Use /stop to unsubscribe, /check anytime for the current state.\n\n'
+        : "👋 You're already subscribed. Current state:\n\n";
       await tg(env, {
-        chat_id: update.message.chat.id,
-        text:
-          (text === '/start' ? '👋 Hi! I monitor Kamino multiply liquidity and ping you when it opens.\n\n' : '') +
-          formatTable(data),
+        chat_id: chatId,
+        text: intro + formatTable(data),
         parse_mode: 'HTML',
         disable_web_page_preview: true,
         reply_markup: INLINE_KEYBOARD,
+      });
+    } else if (text === '/check') {
+      const data = await fetchLiquidity();
+      await tg(env, {
+        chat_id: chatId,
+        text: formatTable(data),
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        reply_markup: INLINE_KEYBOARD,
+      });
+    } else if (text === '/stop') {
+      let msg;
+      if (chatId === owner) {
+        msg = "You're the bot owner — you always receive alerts. /stop is a no-op here.";
+      } else {
+        const removed = await removeSubscriber(env, chatId);
+        msg = removed
+          ? '🔕 Unsubscribed. Use /start to subscribe again.'
+          : "You weren't subscribed.";
+      }
+      await tg(env, { chat_id: chatId, text: msg });
+    } else if (text === '/who' && chatId === owner) {
+      const subs = await getSubscribers(env);
+      await tg(env, {
+        chat_id: chatId,
+        text: `Subscribers: ${subs.size}\n${[...subs].join(', ') || '(empty)'}`,
       });
     }
   }

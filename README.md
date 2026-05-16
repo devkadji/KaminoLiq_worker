@@ -11,8 +11,16 @@ Replaces an earlier GitHub Actions cron (which suffered 30+ minute schedule drif
 
 | Trigger | What runs | What you see |
 |---|---|---|
-| Cron `*/5 * * * *` (reliable, fires on time) | Computes `Borrow Capacity Remaining` for both pairs, compares to last state in KV | Telegram message **only on transition** (closed → open, or open → closed) |
-| Telegram `/start`, `/check`, or **📊 Check liquidity** button | Live computation | Telegram message with current table |
+| Cron `*/5 * * * *` (reliable, fires on time) | Computes `Borrow Capacity Remaining` for both pairs, compares to last state in KV | Telegram broadcast **only on transition** (closed → open, or open → closed) to all subscribers |
+| Telegram `/start` | Subscribes the chat to future alerts, replies with current state | Welcome message + live table |
+| Telegram `/check` or **📊 Check liquidity** button | Live computation | Live table |
+| Telegram `/stop` | Unsubscribes the chat | Confirmation |
+| Telegram `/who` (owner only) | Lists subscribers | Subscriber count + chat ids |
+
+Subscribers are stored in Workers KV (key `subscribers`). The owner — the chat
+id set as `TELEGRAM_CHAT_ID` — is **always** a recipient and can't be removed.
+If any other subscriber blocks the bot, they're dropped from the list silently
+on the next alert.
 
 For these reserves the binding cap is the **90% utilization limit**, so:
 ```
