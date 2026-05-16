@@ -157,6 +157,23 @@ async function formatStatus(env) {
   return lines.join('\n');
 }
 
+function welcomeText() {
+  const products = PAIRS.map((p) => `• ${p.name}`).join('\n');
+  return (
+    '👋 <b>Welcome to KaminoLiq bot!</b>\n\n' +
+    'I watch borrow liquidity on these Kamino multiply products and ping you when a deposit window opens or closes:\n\n' +
+    products +
+    '\n\n' +
+    '<b>Commands:</b>\n' +
+    '/check — show current depositable status for all products\n' +
+    '/status — bot health (last cron tick, subscriber count, per-pair last-seen)\n' +
+    '/stop — unsubscribe from alerts\n' +
+    '/start — re-read this welcome (and re-subscribe if needed)\n\n' +
+    'You will get a 🟢 message when liquidity opens up, and a 🔴 message when it closes again. ' +
+    'Tap the <b>📊 Check liquidity</b> button on any of my messages to refresh on demand.\n\n'
+  );
+}
+
 function formatTable(data) {
   const lines = ['📊 <b>Borrow Capacity Remaining</b>', ''];
   for (const p of data) {
@@ -339,13 +356,15 @@ async function handleWebhook(request, env) {
     if (text === '/start') {
       const added = await addSubscriber(env, chatId);
       const data = await fetchLiquidity();
-      const intro = added
-        ? "👋 Subscribed! You'll get a ping when borrow liquidity opens up.\n" +
-          'Use /stop to unsubscribe, /check anytime for the current state.\n\n'
-        : "👋 You're already subscribed. Current state:\n\n";
+      const isOwner = chatId === owner;
+      const subscribeNote = isOwner
+        ? '<i>(you are the bot owner — you always receive alerts)</i>\n\n'
+        : added
+          ? "✅ You're now subscribed.\n\n"
+          : '<i>(already subscribed)</i>\n\n';
       await tg(env, {
         chat_id: chatId,
-        text: intro + formatTable(data),
+        text: welcomeText() + subscribeNote + formatTable(data),
         parse_mode: 'HTML',
         disable_web_page_preview: true,
         reply_markup: INLINE_KEYBOARD,
