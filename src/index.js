@@ -136,7 +136,7 @@ async function formatStatus(env) {
     '',
     `Last cron tick:   ${tickLine}`,
     `Cron schedule:    <code>${cron}</code>`,
-    `Subscribers:      ${subs.size}`,
+    `Subscribers:      ${subs.size} (+ owner)`,
     `Pairs monitored:  ${PAIRS.length}`,
     '',
     '<b>Per-pair last seen:</b>',
@@ -147,7 +147,8 @@ async function formatStatus(env) {
       lines.push(`  ${p.name} — no data yet`);
     } else {
       const status = s.open ? '🟢 open' : 'closed';
-      lines.push(`  ${p.name}  ${status}  util ${s.utilizationPct}%  (${relTime(s.checkedAt)})`);
+      const utilStr = Number(s.utilizationPct).toFixed(2);
+      lines.push(`  ${p.name}  ${status}  util ${utilStr}%  (${relTime(s.checkedAt)})`);
     }
   }
   return lines.join('\n');
