@@ -102,6 +102,57 @@ async function tg(env, payload) {
   return res.json();
 }
 
+function relTime(iso) {
+  if (!iso) return 'never';
+  const diff = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  return `${Math.floor(diff / 86400)}d ago`;
+}
+
+async function formatStatus(env) {
+  const lastTick = await env.STATE.get('lastTick', 'json');
+  const state = (await env.STATE.get('state', 'json')) || {};
+  const subs = await getSubscribers(env);
+  const cron = '*/5 * * * *';
+
+  const ageMin = lastTick?.at
+    ? (Date.now() - new Date(lastTick.at).getTime()) / 60000
+    : Infinity;
+  const emoji = ageMin <= 10 ? '🟢' : ageMin <= 30 ? '🟡' : '🔴';
+
+  let tickLine;
+  if (!lastTick?.at) {
+    tickLine = 'never';
+  } else {
+    const ts = lastTick.at.replace('T', ' ').slice(0, 19);
+    const status = lastTick.ok ? 'ok' : `FAILED: ${lastTick.error || 'unknown'}`;
+    tickLine = `${ts} UTC  (${relTime(lastTick.at)}, ${status})`;
+  }
+
+  const lines = [
+    `${emoji} <b>Bot status</b>`,
+    '',
+    `Last cron tick:   ${tickLine}`,
+    `Cron schedule:    <code>${cron}</code>`,
+    `Subscribers:      ${subs.size}`,
+    `Pairs monitored:  ${PAIRS.length}`,
+    '',
+    '<b>Per-pair last seen:</b>',
+  ];
+  for (const p of PAIRS) {
+    const s = state[p.name];
+    if (!s) {
+      lines.push(`  ${p.name} — no data yet`);
+    } else {
+      const status = s.open ? '🟢 open' : 'closed';
+      lines.push(`  ${p.name}  ${status}  util ${s.utilizationPct}%  (${relTime(s.checkedAt)})`);
+    }
+  }
+  return lines.join('\n');
+}
+
 function formatTable(data) {
   const lines = ['📊 <b>Borrow Capacity Remaining</b>', ''];
   for (const p of data) {
@@ -179,6 +230,22 @@ async function broadcast(env, payload) {
 }
 
 async function handleScheduled(env) {
+  // Always record that the cron *attempted* a tick, even if Kamino fails — so /status
+  // can distinguish "cron stopped firing" (lastTick stale) from "Kamino API down"
+  // (lastTick fresh, per-pair checkedAt stale).
+  const tickRecord = { at: new Date().toISOString(), ok: false };
+  try {
+    await runCron(env);
+    tickRecord.ok = true;
+  } catch (err) {
+    tickRecord.error = String(err.message || err).slice(0, 200);
+    throw err;
+  } finally {
+    await env.STATE.put('lastTick', JSON.stringify(tickRecord));
+  }
+}
+
+async function runCron(env) {
   const data = await fetchLiquidity();
   const prev = (await env.STATE.get('state', 'json')) || {};
   const next = {};
@@ -280,6 +347,13 @@ async function handleWebhook(request, env) {
           : "You weren't subscribed.";
       }
       await tg(env, { chat_id: chatId, text: msg });
+    } else if (text === '/status') {
+      await tg(env, {
+        chat_id: chatId,
+        text: await formatStatus(env),
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      });
     } else if (text === '/who' && chatId === owner) {
       const subs = await getSubscribers(env);
       await tg(env, {

@@ -17,6 +17,7 @@ Replaces an earlier GitHub Actions cron (which suffered 30+ minute schedule drif
 | Telegram `/start` | Subscribes the chat to future alerts, replies with current state | Welcome message + live table |
 | Telegram `/check` or **📊 Check liquidity** button | Live computation | Live table |
 | Telegram `/stop` | Unsubscribes the chat | Confirmation |
+| Telegram `/status` | Bot health check | Last cron tick + age, schedule, subscriber count, per-pair last-seen |
 | Telegram `/who` (owner only) | Lists subscribers | Subscriber count + chat ids |
 
 Subscribers are stored in Workers KV (key `subscribers`). The owner — the chat
