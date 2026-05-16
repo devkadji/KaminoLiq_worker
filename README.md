@@ -1,9 +1,10 @@
 # Kamino liquidity worker
 
-Cloudflare Worker that monitors Kamino multiply borrow liquidity for three loops:
+Cloudflare Worker that monitors Kamino multiply borrow liquidity for four loops:
 
 - **ONyc/USDG Multiply** (OnRe market, utilization cap 90%)
 - **ONyc/USDC Multiply** (OnRe market, utilization cap 90%)
+- **ONyc/USDS Multiply** (OnRe market, utilization cap 90%)
 - **USDe/USDG Multiply** (separate market, utilization cap 100%)
 
 Replaces an earlier GitHub Actions cron (which suffered 30+ minute schedule drift).

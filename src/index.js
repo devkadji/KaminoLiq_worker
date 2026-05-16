@@ -32,6 +32,14 @@ const PAIRS = [
     url: `https://kamino.com/multiply/${ONRE_MARKET}/6ZxkBSJEqsXA3Kdm2PDAzHLUdPTPUK93Lf4bAezec1UQ/AYL4LMc4ZCVyq3Z7XPJGWDM4H9PiWjqXAAuuHBEGVR2Z`,
   },
   {
+    name: 'ONyc/USDS Multiply',
+    symbol: 'USDS',
+    market: ONRE_MARKET,
+    reserve: '3yDc9ARvtPLhYxZLgucZGuBtZ9bHshBvXTwHxGe3nhmC',
+    utilizationCap: 0.9,
+    url: `https://kamino.com/multiply/${ONRE_MARKET}/6ZxkBSJEqsXA3Kdm2PDAzHLUdPTPUK93Lf4bAezec1UQ/3yDc9ARvtPLhYxZLgucZGuBtZ9bHshBvXTwHxGe3nhmC`,
+  },
+  {
     name: 'USDe/USDG Multiply',
     symbol: 'USDG',
     market: USDE_MARKET,
