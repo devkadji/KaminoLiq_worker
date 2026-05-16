@@ -1,0 +1,13 @@
+name = "kamino-liquidity-worker"
+main = "src/index.js"
+compatibility_date = "2025-04-01"
+
+# Reliable cron — fires within seconds of schedule, unlike GitHub Actions.
+[triggers]
+crons = ["*/5 * * * *"]
+
+# KV namespace for persisting open/closed state across cron ticks.
+# The id is patched in after `wrangler kv namespace create STATE` runs.
+[[kv_namespaces]]
+binding = "STATE"
+id = "ddda91b49e344dc29cef0607d0009ffb"

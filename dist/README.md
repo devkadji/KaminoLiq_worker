@@ -1,0 +1,1 @@
+This folder contains the built output assets for the worker "kamino-liquidity-worker" generated at 2026-05-16T12:38:20.742Z.
