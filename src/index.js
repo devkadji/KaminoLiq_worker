@@ -293,8 +293,13 @@ async function handleWebhook(request, env) {
   // Inline-keyboard button taps
   if (update.callback_query) {
     const cq = update.callback_query;
-    // ack first so Telegram dismisses the spinner immediately
-    await tg(env, { method: 'answerCallbackQuery', callback_query_id: cq.id });
+    // Best-effort ack so Telegram dismisses the spinner. Don't let an ack failure
+    // (expired query id, transient Telegram error) prevent the subscribe + reply.
+    try {
+      await tg(env, { method: 'answerCallbackQuery', callback_query_id: cq.id });
+    } catch (err) {
+      console.error('answerCallbackQuery failed (non-fatal):', err.message);
+    }
     if (cq.data === 'check') {
       const chatId = cq.message.chat.id;
       const owner = Number(env.TELEGRAM_CHAT_ID);
