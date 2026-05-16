@@ -145,11 +145,14 @@ async function formatStatus(env) {
     const s = state[p.name];
     if (!s) {
       lines.push(`  ${p.name} — no data yet`);
-    } else {
-      const status = s.open ? '🟢 open' : 'closed';
-      const utilStr = Number(s.utilizationPct).toFixed(2);
-      lines.push(`  ${p.name}  ${status}  util ${utilStr}%  (${relTime(s.checkedAt)})`);
+      continue;
     }
+    const utilStr = Number(s.utilizationPct).toFixed(2);
+    const capStr = (p.utilizationCap * 100).toFixed(0);
+    const summary = s.open
+      ? `🟢 depositable: ${fmt(s.available)} ${p.symbol}`
+      : `closed  util ${utilStr}% / cap ${capStr}%`;
+    lines.push(`  ${p.name}  ${summary}  (${relTime(s.checkedAt)})`);
   }
   return lines.join('\n');
 }
@@ -157,10 +160,16 @@ async function formatStatus(env) {
 function formatTable(data) {
   const lines = ['📊 <b>Borrow Capacity Remaining</b>', ''];
   for (const p of data) {
-    const availStr = p.available > 0 ? `${fmt(p.available)} ${p.symbol}` : `0 ${p.symbol}`;
+    const utilStr = (p.utilization * 100).toFixed(2);
+    const capStr = (p.utilizationCap * 100).toFixed(0);
     lines.push(`<b>${p.name}</b>`);
-    lines.push(`  Available: ${availStr}`);
-    lines.push(`  Utilization: ${(p.utilization * 100).toFixed(2)}%`);
+    if (p.available > 0) {
+      lines.push(`  🟢 Depositable: ${fmt(p.available)} ${p.symbol}`);
+      lines.push(`  <i>util ${utilStr}% / cap ${capStr}%</i>`);
+    } else {
+      lines.push(`  Depositable: no`);
+      lines.push(`  <i>util ${utilStr}% / cap ${capStr}%</i>`);
+    }
     lines.push('');
   }
   const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
