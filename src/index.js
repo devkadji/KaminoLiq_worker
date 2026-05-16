@@ -150,8 +150,8 @@ async function formatStatus(env) {
     const utilStr = Number(s.utilizationPct).toFixed(2);
     const capStr = (p.utilizationCap * 100).toFixed(0);
     const summary = s.open
-      ? `🟢 depositable: ${fmt(s.available)} ${p.symbol}`
-      : `closed  util ${utilStr}% / cap ${capStr}%`;
+      ? `🟢 <b>depositable: yes</b> (${fmt(s.available)} ${p.symbol})`
+      : `🔴 <b>depositable: no</b>  <i>util ${utilStr}% / cap ${capStr}%</i>`;
     lines.push(`  ${p.name}  ${summary}  (${relTime(s.checkedAt)})`);
   }
   return lines.join('\n');
@@ -181,12 +181,11 @@ function formatTable(data) {
     const capStr = (p.utilizationCap * 100).toFixed(0);
     lines.push(`<b>${p.name}</b>`);
     if (p.available > 0) {
-      lines.push(`  🟢 Depositable: ${fmt(p.available)} ${p.symbol}`);
-      lines.push(`  <i>util ${utilStr}% / cap ${capStr}%</i>`);
+      lines.push(`  🟢 <b>Depositable: yes</b> — ${fmt(p.available)} ${p.symbol}`);
     } else {
-      lines.push(`  Depositable: no`);
-      lines.push(`  <i>util ${utilStr}% / cap ${capStr}%</i>`);
+      lines.push(`  🔴 <b>Depositable: no</b>`);
     }
+    lines.push(`  <i>util ${utilStr}% / cap ${capStr}%</i>`);
     lines.push('');
   }
   const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
