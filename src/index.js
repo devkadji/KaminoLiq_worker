@@ -296,10 +296,18 @@ async function handleWebhook(request, env) {
     // ack first so Telegram dismisses the spinner immediately
     await tg(env, { method: 'answerCallbackQuery', callback_query_id: cq.id });
     if (cq.data === 'check') {
+      const chatId = cq.message.chat.id;
+      const owner = Number(env.TELEGRAM_CHAT_ID);
+      // Auto-subscribe on first button tap so users don't have to know about /start.
+      // Skip for the owner (they always receive alerts; the notice would be misleading).
+      const newlySubscribed = chatId !== owner && (await addSubscriber(env, chatId));
       const data = await fetchLiquidity();
+      const prefix = newlySubscribed
+        ? "✅ You're now subscribed to alerts (use /stop to unsubscribe).\n\n"
+        : '';
       await tg(env, {
-        chat_id: cq.message.chat.id,
-        text: formatTable(data),
+        chat_id: chatId,
+        text: prefix + formatTable(data),
         parse_mode: 'HTML',
         disable_web_page_preview: true,
         reply_markup: INLINE_KEYBOARD,
@@ -357,9 +365,12 @@ async function handleWebhook(request, env) {
       });
     } else if (text === '/who' && chatId === owner) {
       const subs = await getSubscribers(env);
+      // Owner always receives, count them in total recipients regardless of /start.
+      const all = new Set([...subs, owner]);
+      const lines = [...all].map((id) => (id === owner ? `${id} (owner)` : `${id}`));
       await tg(env, {
         chat_id: chatId,
-        text: `Subscribers: ${subs.size}\n${[...subs].join(', ') || '(empty)'}`,
+        text: `Total recipients: ${all.size}\n${lines.join('\n')}`,
       });
     }
   }
