@@ -8,22 +8,36 @@
 // For these two reserves the binding cap is the reserve utilization cap (90%),
 // so "Borrow Capacity Remaining" = min(cash, totalSupply * (cap - currentUtil)).
 
-const MARKET = '47tfyEG9SsdEnUm9cw5kY9BXngQGqu3LBoop9j5uTAv8';
-const KAMINO_URL = `https://api.kamino.finance/kamino-market/${MARKET}/reserves/metrics`;
-const UTILIZATION_CAP = 0.9;
+// Each pair has its own market + debt reserve + utilization cap. Caps come from
+// the on-chain reserve config (verified once via klend-sdk); if Kamino changes
+// a cap, update the constant here. Markets are deduplicated when fetching.
+const ONRE_MARKET = '47tfyEG9SsdEnUm9cw5kY9BXngQGqu3LBoop9j5uTAv8';
+const USDE_MARKET = 'BJnbcRHqvppTyGesLzWASGKnmnF1wq9jZu6ExrjT7wvF';
 
 const PAIRS = [
   {
     name: 'ONyc/USDG Multiply',
     symbol: 'USDG',
+    market: ONRE_MARKET,
     reserve: 'JBmLCoKqjdKSStK45onRqe6U6sxVgSpdXoeXe4h7NwJw',
-    url: 'https://kamino.com/multiply/47tfyEG9SsdEnUm9cw5kY9BXngQGqu3LBoop9j5uTAv8/6ZxkBSJEqsXA3Kdm2PDAzHLUdPTPUK93Lf4bAezec1UQ/JBmLCoKqjdKSStK45onRqe6U6sxVgSpdXoeXe4h7NwJw',
+    utilizationCap: 0.9,
+    url: `https://kamino.com/multiply/${ONRE_MARKET}/6ZxkBSJEqsXA3Kdm2PDAzHLUdPTPUK93Lf4bAezec1UQ/JBmLCoKqjdKSStK45onRqe6U6sxVgSpdXoeXe4h7NwJw`,
   },
   {
     name: 'ONyc/USDC Multiply',
     symbol: 'USDC',
+    market: ONRE_MARKET,
     reserve: 'AYL4LMc4ZCVyq3Z7XPJGWDM4H9PiWjqXAAuuHBEGVR2Z',
-    url: 'https://kamino.com/multiply/47tfyEG9SsdEnUm9cw5kY9BXngQGqu3LBoop9j5uTAv8/6ZxkBSJEqsXA3Kdm2PDAzHLUdPTPUK93Lf4bAezec1UQ/AYL4LMc4ZCVyq3Z7XPJGWDM4H9PiWjqXAAuuHBEGVR2Z',
+    utilizationCap: 0.9,
+    url: `https://kamino.com/multiply/${ONRE_MARKET}/6ZxkBSJEqsXA3Kdm2PDAzHLUdPTPUK93Lf4bAezec1UQ/AYL4LMc4ZCVyq3Z7XPJGWDM4H9PiWjqXAAuuHBEGVR2Z`,
+  },
+  {
+    name: 'USDe/USDG Multiply',
+    symbol: 'USDG',
+    market: USDE_MARKET,
+    reserve: 'Q5av3wh8j9KCqSjs9njUdsPhrMSKBCUyr4VyUndUUFA',
+    utilizationCap: 1.0,
+    url: `https://kamino.com/multiply/${USDE_MARKET}/2erD9GTGcaQbLsVSQweg3HvMpfKxScmz95raWv8H4iPN/Q5av3wh8j9KCqSjs9njUdsPhrMSKBCUyr4VyUndUUFA`,
   },
 ];
 
@@ -36,17 +50,29 @@ function fmt(n) {
 }
 
 async function fetchLiquidity() {
-  const res = await fetch(KAMINO_URL, { cf: { cacheTtl: 0, cacheEverything: false } });
-  if (!res.ok) throw new Error(`Kamino API ${res.status}`);
-  const reserves = await res.json();
-  const byAddr = new Map(reserves.map((r) => [r.reserve, r]));
+  // Hit each market's metrics endpoint once, even if multiple pairs use it.
+  const markets = [...new Set(PAIRS.map((p) => p.market))];
+  const reservesByMarket = new Map(
+    await Promise.all(
+      markets.map(async (m) => {
+        const res = await fetch(
+          `https://api.kamino.finance/kamino-market/${m}/reserves/metrics`,
+          { cf: { cacheTtl: 0, cacheEverything: false } },
+        );
+        if (!res.ok) throw new Error(`Kamino API ${m}: ${res.status}`);
+        const arr = await res.json();
+        return [m, new Map(arr.map((r) => [r.reserve, r]))];
+      }),
+    ),
+  );
+
   return PAIRS.map((p) => {
-    const r = byAddr.get(p.reserve);
-    if (!r) throw new Error(`reserve ${p.reserve} not in API response`);
+    const r = reservesByMarket.get(p.market).get(p.reserve);
+    if (!r) throw new Error(`reserve ${p.reserve} not in market ${p.market}`);
     const totalSupply = Number(r.totalSupply);
     const totalBorrow = Number(r.totalBorrow);
     const utilization = totalSupply > 0 ? totalBorrow / totalSupply : 0;
-    const headroom = Math.max(0, totalSupply * (UTILIZATION_CAP - utilization));
+    const headroom = Math.max(0, totalSupply * (p.utilizationCap - utilization));
     const cash = Math.max(0, totalSupply - totalBorrow);
     return {
       ...p,

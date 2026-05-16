@@ -1,9 +1,10 @@
 # Kamino liquidity worker
 
-Cloudflare Worker that monitors Kamino multiply borrow liquidity for two RWA loops:
+Cloudflare Worker that monitors Kamino multiply borrow liquidity for three loops:
 
-- **ONyc/USDG Multiply**
-- **ONyc/USDC Multiply**
+- **ONyc/USDG Multiply** (OnRe market, utilization cap 90%)
+- **ONyc/USDC Multiply** (OnRe market, utilization cap 90%)
+- **USDe/USDG Multiply** (separate market, utilization cap 100%)
 
 Replaces an earlier GitHub Actions cron (which suffered 30+ minute schedule drift).
 
@@ -22,13 +23,15 @@ id set as `TELEGRAM_CHAT_ID` — is **always** a recipient and can't be removed.
 If any other subscriber blocks the bot, they're dropped from the list silently
 on the next alert.
 
-For these reserves the binding cap is the **90% utilization limit**, so:
+For these reserves the binding cap is the reserve utilization cap, so:
 ```
-available = min(  totalSupply * (0.9 - utilization),   totalSupply - totalBorrow  )
+available = min(  totalSupply * (utilizationCap - currentUtilization),   totalSupply - totalBorrow  )
 ```
-…clamped at zero. Reproduces what Kamino's UI shows. Data comes from the public
+…clamped at zero. Reproduces what Kamino's UI shows. Per-pair `utilizationCap`
+is hardcoded in `src/index.js` (verified once with klend-sdk against the
+on-chain reserve config). Data comes from the public
 `api.kamino.finance/kamino-market/{m}/reserves/metrics` endpoint — no auth, no
-on-chain RPC, no klend-sdk on the worker (which keeps the bundle at ~6 KB).
+on-chain RPC, no klend-sdk on the worker (which keeps the bundle small).
 
 ## Files
 
