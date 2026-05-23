@@ -111,9 +111,24 @@ function relTime(iso) {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
+// Single combined snapshot — replaces the old `state` + `lastTick` two-key
+// pattern with one key holding both. Cuts KV writes per cron tick from 2 → 1,
+// which keeps us comfortably inside the free-tier 1000 writes/day limit.
+async function loadSnapshot(env) {
+  const snap = await env.STATE.get('snapshot', 'json');
+  if (snap && snap.pairs) return snap;
+  // Fallback for the very first invocation after this deploy: stitch together
+  // the old two keys so we don't lose open/closed armed state and double-fire
+  // existing-open transitions as "newly opened".
+  const tick = await env.STATE.get('lastTick', 'json');
+  const pairs = (await env.STATE.get('state', 'json')) || {};
+  return { tick: tick || null, pairs };
+}
+
 async function formatStatus(env) {
-  const lastTick = await env.STATE.get('lastTick', 'json');
-  const state = (await env.STATE.get('state', 'json')) || {};
+  const snapshot = await loadSnapshot(env);
+  const lastTick = snapshot.tick;
+  const state = snapshot.pairs || {};
   const subs = await getSubscribers(env);
   const cron = '*/5 * * * *';
 
@@ -256,24 +271,33 @@ async function broadcast(env, payload) {
 }
 
 async function handleScheduled(env) {
-  // Always record that the cron *attempted* a tick, even if Kamino fails — so /status
-  // can distinguish "cron stopped firing" (lastTick stale) from "Kamino API down"
-  // (lastTick fresh, per-pair checkedAt stale).
+  // Load previous snapshot (pairs + last tick) in one read. We'll write the
+  // updated combined snapshot ONCE at the end — saves 1 KV write per tick
+  // compared to the old two-key approach (`state` + `lastTick`).
+  const snapshot = await loadSnapshot(env);
   const tickRecord = { at: new Date().toISOString(), ok: false };
+  let nextPairs = snapshot.pairs || {};
+  let caught = null;
   try {
-    await runCron(env);
+    nextPairs = await runCron(env, snapshot.pairs || {});
     tickRecord.ok = true;
   } catch (err) {
     tickRecord.error = String(err.message || err).slice(0, 200);
-    throw err;
-  } finally {
-    await env.STATE.put('lastTick', JSON.stringify(tickRecord));
+    caught = err;
   }
+  // Single write — combines tick heartbeat + per-pair state.
+  await env.STATE.put(
+    'snapshot',
+    JSON.stringify({ tick: tickRecord, pairs: nextPairs }),
+  );
+  if (caught) throw caught;
 }
 
-async function runCron(env) {
+// Pure-ish: takes the previous per-pair state in, returns the new per-pair
+// state out. Side effects = Telegram broadcasts on transitions. No KV writes
+// (handleScheduled is the one place that writes the combined snapshot).
+async function runCron(env, prev) {
   const data = await fetchLiquidity();
-  const prev = (await env.STATE.get('state', 'json')) || {};
   const next = {};
   for (const p of data) {
     const isOpen = p.available > 0;
@@ -305,7 +329,7 @@ async function runCron(env) {
       });
     }
   }
-  await env.STATE.put('state', JSON.stringify(next));
+  return next;
 }
 
 async function handleWebhook(request, env) {
