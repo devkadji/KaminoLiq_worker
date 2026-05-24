@@ -44,13 +44,61 @@ const PAIRS = [
     symbol: 'USDG',
     market: USDE_MARKET,
     reserve: 'Q5av3wh8j9KCqSjs9njUdsPhrMSKBCUyr4VyUndUUFA',
-    // Lowered by Kamino admin from 100% → 95% (verified 2026-05-25 via klend-sdk).
-    // Caps can change again; if /check shows depositable while the Kamino UI says
-    // "Borrow Capacity Remaining 0", re-run the audit (see notes in this repo).
+    // utilizationCap fields are now FALLBACKS only — the actual cap is fetched
+    // on-chain every tick (see fetchLiveUtilizationCaps). The value here is
+    // used only if the Solana RPC fetch fails.
     utilizationCap: 0.95,
     url: `https://kamino.com/multiply/${USDE_MARKET}/2erD9GTGcaQbLsVSQweg3HvMpfKxScmz95raWv8H4iPN/Q5av3wh8j9KCqSjs9njUdsPhrMSKBCUyr4VyUndUUFA`,
   },
 ];
+
+// --- Live on-chain cap reads ---
+// Kamino can update a reserve's utilization cap at any time. Hardcoding it
+// causes silent drift between the bot's "depositable" calculation and what the
+// Kamino UI shows. To stay in sync, we read the actual cap directly from each
+// reserve account via Solana RPC with a `dataSlice` (one byte per reserve, ~4
+// bytes total per tick — much lighter than running the klend-sdk in a worker).
+const SOLANA_RPC = 'https://api.mainnet-beta.solana.com';
+// Byte offset of `config.utilizationLimitBlockBorrowingAbovePct` (a u8 percent
+// value 0..100) within Kamino's Reserve account data. Verified empirically by
+// intersecting offsets where multiple reserves' values match across 4
+// different debt reserves. Would only need updating if Kamino restructures
+// the Reserve account in a program upgrade.
+const UTIL_CAP_OFFSET = 5501;
+
+async function fetchLiveUtilizationCaps() {
+  const addrs = PAIRS.map((p) => p.reserve);
+  const body = {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'getMultipleAccounts',
+    params: [
+      addrs,
+      { encoding: 'base64', dataSlice: { offset: UTIL_CAP_OFFSET, length: 1 } },
+    ],
+  };
+  const res = await fetch(SOLANA_RPC, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Solana RPC ${res.status}`);
+  const json = await res.json();
+  if (json.error) throw new Error(`Solana RPC: ${json.error.message || JSON.stringify(json.error)}`);
+  const accs = json.result?.value || [];
+  const out = {};
+  for (let i = 0; i < addrs.length; i++) {
+    const acc = accs[i];
+    if (!acc?.data?.[0]) continue;
+    const byte = atob(acc.data[0]).charCodeAt(0);
+    // Sanity check — cap should be a percent 0..100. Anything else means our
+    // offset is wrong (Kamino changed the struct?) — discard and fall back.
+    if (Number.isFinite(byte) && byte >= 0 && byte <= 100) {
+      out[addrs[i]] = byte / 100;
+    }
+  }
+  return out;
+}
 
 const INLINE_KEYBOARD = {
   inline_keyboard: [[{ text: '📊 Check liquidity', callback_data: 'check' }]],
@@ -63,8 +111,9 @@ function fmt(n) {
 async function fetchLiquidity() {
   // Hit each market's metrics endpoint once, even if multiple pairs use it.
   const markets = [...new Set(PAIRS.map((p) => p.market))];
-  const reservesByMarket = new Map(
-    await Promise.all(
+  // In parallel: fetch per-market metrics AND on-chain live utilization caps.
+  const [metricsArr, liveCaps] = await Promise.all([
+    Promise.all(
       markets.map(async (m) => {
         const res = await fetch(
           `https://api.kamino.finance/kamino-market/${m}/reserves/metrics`,
@@ -75,18 +124,26 @@ async function fetchLiquidity() {
         return [m, new Map(arr.map((r) => [r.reserve, r]))];
       }),
     ),
-  );
+    fetchLiveUtilizationCaps().catch((e) => {
+      console.error('on-chain cap fetch failed, using hardcoded fallbacks:', e.message);
+      return {};
+    }),
+  ]);
+  const reservesByMarket = new Map(metricsArr);
 
   return PAIRS.map((p) => {
     const r = reservesByMarket.get(p.market).get(p.reserve);
     if (!r) throw new Error(`reserve ${p.reserve} not in market ${p.market}`);
+    // Use live cap when available; fall back to hardcoded if the RPC call failed.
+    const utilizationCap = liveCaps[p.reserve] ?? p.utilizationCap;
     const totalSupply = Number(r.totalSupply);
     const totalBorrow = Number(r.totalBorrow);
     const utilization = totalSupply > 0 ? totalBorrow / totalSupply : 0;
-    const headroom = Math.max(0, totalSupply * (p.utilizationCap - utilization));
+    const headroom = Math.max(0, totalSupply * (utilizationCap - utilization));
     const cash = Math.max(0, totalSupply - totalBorrow);
     return {
       ...p,
+      utilizationCap,         // overrides the hardcoded value with the live one
       utilization,
       available: Math.min(headroom, cash),
     };
@@ -166,7 +223,9 @@ async function formatStatus(env) {
       continue;
     }
     const utilStr = Number(s.utilizationPct).toFixed(2);
-    const capStr = (p.utilizationCap * 100).toFixed(0);
+    // Prefer the live on-chain cap stored on the snapshot; fall back to the
+    // hardcoded PAIRS value for snapshots written before this field existed.
+    const capStr = ((s.utilizationCapPct ?? p.utilizationCap * 100)).toFixed(0);
     const summary = s.open
       ? `🟢 <b>depositable: yes</b> (${fmt(s.available)} ${p.symbol})`
       : `🔴 <b>depositable: no</b>  <i>util ${utilStr}% / cap ${capStr}%</i>`;
@@ -309,6 +368,7 @@ async function runCron(env, prev) {
       open: isOpen,
       available: p.available,
       utilizationPct: Number((p.utilization * 100).toFixed(2)),
+      utilizationCapPct: Number((p.utilizationCap * 100).toFixed(0)),
       checkedAt: new Date().toISOString(),
     };
     if (isOpen && !wasOpen) {
