@@ -44,7 +44,10 @@ const PAIRS = [
     symbol: 'USDG',
     market: USDE_MARKET,
     reserve: 'Q5av3wh8j9KCqSjs9njUdsPhrMSKBCUyr4VyUndUUFA',
-    utilizationCap: 1.0,
+    // Lowered by Kamino admin from 100% → 95% (verified 2026-05-25 via klend-sdk).
+    // Caps can change again; if /check shows depositable while the Kamino UI says
+    // "Borrow Capacity Remaining 0", re-run the audit (see notes in this repo).
+    utilizationCap: 0.95,
     url: `https://kamino.com/multiply/${USDE_MARKET}/2erD9GTGcaQbLsVSQweg3HvMpfKxScmz95raWv8H4iPN/Q5av3wh8j9KCqSjs9njUdsPhrMSKBCUyr4VyUndUUFA`,
   },
 ];
