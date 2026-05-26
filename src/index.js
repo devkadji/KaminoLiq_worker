@@ -58,7 +58,11 @@ const PAIRS = [
 // Kamino UI shows. To stay in sync, we read the actual cap directly from each
 // reserve account via Solana RPC with a `dataSlice` (one byte per reserve, ~4
 // bytes total per tick — much lighter than running the klend-sdk in a worker).
-const SOLANA_RPC = 'https://api.mainnet-beta.solana.com';
+// Default RPC: api.mainnet-beta.solana.com blocks Cloudflare Workers' egress
+// IPs with HTTP 403, so we use Allnodes' publicnode (no key, supports
+// `dataSlice`, accepts requests from CF). Override via the SOLANA_RPC secret
+// if you want to point at Helius/another provider.
+const DEFAULT_SOLANA_RPC = 'https://solana-rpc.publicnode.com';
 // Byte offset of `config.utilizationLimitBlockBorrowingAbovePct` (a u8 percent
 // value 0..100) within Kamino's Reserve account data. Verified empirically by
 // intersecting offsets where multiple reserves' values match across 4
@@ -66,7 +70,8 @@ const SOLANA_RPC = 'https://api.mainnet-beta.solana.com';
 // the Reserve account in a program upgrade.
 const UTIL_CAP_OFFSET = 5501;
 
-async function fetchLiveUtilizationCaps() {
+async function fetchLiveUtilizationCaps(env) {
+  const rpcUrl = (env && env.SOLANA_RPC) || DEFAULT_SOLANA_RPC;
   const addrs = PAIRS.map((p) => p.reserve);
   const body = {
     jsonrpc: '2.0',
@@ -77,12 +82,12 @@ async function fetchLiveUtilizationCaps() {
       { encoding: 'base64', dataSlice: { offset: UTIL_CAP_OFFSET, length: 1 } },
     ],
   };
-  const res = await fetch(SOLANA_RPC, {
+  const res = await fetch(rpcUrl, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`Solana RPC ${res.status}`);
+  if (!res.ok) throw new Error(`Solana RPC ${res.status} (${rpcUrl})`);
   const json = await res.json();
   if (json.error) throw new Error(`Solana RPC: ${json.error.message || JSON.stringify(json.error)}`);
   const accs = json.result?.value || [];
@@ -108,7 +113,7 @@ function fmt(n) {
   return n.toLocaleString('en-US', { maximumFractionDigits: 2 });
 }
 
-async function fetchLiquidity() {
+async function fetchLiquidity(env) {
   // Hit each market's metrics endpoint once, even if multiple pairs use it.
   const markets = [...new Set(PAIRS.map((p) => p.market))];
   // In parallel: fetch per-market metrics AND on-chain live utilization caps.
@@ -124,7 +129,7 @@ async function fetchLiquidity() {
         return [m, new Map(arr.map((r) => [r.reserve, r]))];
       }),
     ),
-    fetchLiveUtilizationCaps().catch((e) => {
+    fetchLiveUtilizationCaps(env).catch((e) => {
       console.error('on-chain cap fetch failed, using hardcoded fallbacks:', e.message);
       return {};
     }),
@@ -359,7 +364,7 @@ async function handleScheduled(env) {
 // state out. Side effects = Telegram broadcasts on transitions. No KV writes
 // (handleScheduled is the one place that writes the combined snapshot).
 async function runCron(env, prev) {
-  const data = await fetchLiquidity();
+  const data = await fetchLiquidity(env);
   const next = {};
   for (const p of data) {
     const isOpen = p.available > 0;
@@ -418,7 +423,7 @@ async function handleWebhook(request, env) {
       // Auto-subscribe on first button tap so users don't have to know about /start.
       // Skip for the owner (they always receive alerts; the notice would be misleading).
       const newlySubscribed = chatId !== owner && (await addSubscriber(env, chatId));
-      const data = await fetchLiquidity();
+      const data = await fetchLiquidity(env);
       const prefix = newlySubscribed
         ? "✅ You're now subscribed to alerts (use /stop to unsubscribe).\n\n"
         : '';
@@ -441,7 +446,7 @@ async function handleWebhook(request, env) {
 
     if (text === '/start') {
       const added = await addSubscriber(env, chatId);
-      const data = await fetchLiquidity();
+      const data = await fetchLiquidity(env);
       const isOwner = chatId === owner;
       const subscribeNote = isOwner
         ? '<i>(you are the bot owner — you always receive alerts)</i>\n\n'
@@ -456,7 +461,7 @@ async function handleWebhook(request, env) {
         reply_markup: INLINE_KEYBOARD,
       });
     } else if (text === '/check') {
-      const data = await fetchLiquidity();
+      const data = await fetchLiquidity(env);
       await tg(env, {
         chat_id: chatId,
         text: formatTable(data),
