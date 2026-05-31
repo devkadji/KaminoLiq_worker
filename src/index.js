@@ -14,41 +14,68 @@
 const ONRE_MARKET = '47tfyEG9SsdEnUm9cw5kY9BXngQGqu3LBoop9j5uTAv8';
 const USDE_MARKET = 'BJnbcRHqvppTyGesLzWASGKnmnF1wq9jZu6ExrjT7wvF';
 
+// Each pair needs:
+//   - reserve / depositReserve: borrow + collateral reserves (for util cap, LTV,
+//     borrow APY)
+//   - collTokenMint: identifies the collateral's underlying yield in Kamino's
+//     /yields/{mint}/history endpoint (ONyc tokenizes a real-world credit
+//     pool; USDe pays Ethena funding yield)
+const ONYC_COLL_RESERVE = '6ZxkBSJEqsXA3Kdm2PDAzHLUdPTPUK93Lf4bAezec1UQ';
+const ONYC_MINT = '5Y8NV33Vv7WbnLfq3zBcKSdYPrk7g2KoiQoe7M2tcxp5';
+const USDE_COLL_RESERVE = '2erD9GTGcaQbLsVSQweg3HvMpfKxScmz95raWv8H4iPN';
+const USDE_MINT = 'DEkqHyPN7GMRJ5cArtQFAWefqbZb33Hyf6s5iCwjEonT';
+
 const PAIRS = [
   {
     name: 'ONyc/USDG Multiply',
     symbol: 'USDG',
     market: ONRE_MARKET,
     reserve: 'JBmLCoKqjdKSStK45onRqe6U6sxVgSpdXoeXe4h7NwJw',
+    depositReserve: ONYC_COLL_RESERVE,
+    collTokenMint: ONYC_MINT,
     utilizationCap: 0.9,
-    url: `https://kamino.com/multiply/${ONRE_MARKET}/6ZxkBSJEqsXA3Kdm2PDAzHLUdPTPUK93Lf4bAezec1UQ/JBmLCoKqjdKSStK45onRqe6U6sxVgSpdXoeXe4h7NwJw`,
+    // Debt-side reward emitted to USDG borrowers, in USDG/week. Verified on
+    // kamino.com tooltip "X.XK WEEKLY" — read off the page; update if Kamino
+    // adjusts emissions. Effective APY = weeklyAmount × 52 / debtTotalBorrow,
+    // tracks the reserve TVL automatically.
+    debtRewardWeekly: 7500,
+    url: `https://kamino.com/multiply/${ONRE_MARKET}/${ONYC_COLL_RESERVE}/JBmLCoKqjdKSStK45onRqe6U6sxVgSpdXoeXe4h7NwJw`,
   },
   {
     name: 'ONyc/USDC Multiply',
     symbol: 'USDC',
     market: ONRE_MARKET,
     reserve: 'AYL4LMc4ZCVyq3Z7XPJGWDM4H9PiWjqXAAuuHBEGVR2Z',
+    depositReserve: ONYC_COLL_RESERVE,
+    collTokenMint: ONYC_MINT,
     utilizationCap: 0.9,
-    url: `https://kamino.com/multiply/${ONRE_MARKET}/6ZxkBSJEqsXA3Kdm2PDAzHLUdPTPUK93Lf4bAezec1UQ/AYL4LMc4ZCVyq3Z7XPJGWDM4H9PiWjqXAAuuHBEGVR2Z`,
+    debtRewardWeekly: 4370,
+    url: `https://kamino.com/multiply/${ONRE_MARKET}/${ONYC_COLL_RESERVE}/AYL4LMc4ZCVyq3Z7XPJGWDM4H9PiWjqXAAuuHBEGVR2Z`,
   },
   {
     name: 'ONyc/USDS Multiply',
     symbol: 'USDS',
     market: ONRE_MARKET,
     reserve: '3yDc9ARvtPLhYxZLgucZGuBtZ9bHshBvXTwHxGe3nhmC',
+    depositReserve: ONYC_COLL_RESERVE,
+    collTokenMint: ONYC_MINT,
     utilizationCap: 0.9,
-    url: `https://kamino.com/multiply/${ONRE_MARKET}/6ZxkBSJEqsXA3Kdm2PDAzHLUdPTPUK93Lf4bAezec1UQ/3yDc9ARvtPLhYxZLgucZGuBtZ9bHshBvXTwHxGe3nhmC`,
+    debtRewardWeekly: 0,
+    url: `https://kamino.com/multiply/${ONRE_MARKET}/${ONYC_COLL_RESERVE}/3yDc9ARvtPLhYxZLgucZGuBtZ9bHshBvXTwHxGe3nhmC`,
   },
   {
     name: 'USDe/USDG Multiply',
     symbol: 'USDG',
     market: USDE_MARKET,
     reserve: 'Q5av3wh8j9KCqSjs9njUdsPhrMSKBCUyr4VyUndUUFA',
+    depositReserve: USDE_COLL_RESERVE,
+    collTokenMint: USDE_MINT,
     // utilizationCap fields are now FALLBACKS only — the actual cap is fetched
     // on-chain every tick (see fetchLiveUtilizationCaps). The value here is
     // used only if the Solana RPC fetch fails.
     utilizationCap: 0.95,
-    url: `https://kamino.com/multiply/${USDE_MARKET}/2erD9GTGcaQbLsVSQweg3HvMpfKxScmz95raWv8H4iPN/Q5av3wh8j9KCqSjs9njUdsPhrMSKBCUyr4VyUndUUFA`,
+    debtRewardWeekly: 0,
+    url: `https://kamino.com/multiply/${USDE_MARKET}/${USDE_COLL_RESERVE}/Q5av3wh8j9KCqSjs9njUdsPhrMSKBCUyr4VyUndUUFA`,
   },
 ];
 
@@ -113,11 +140,43 @@ function fmt(n) {
   return n.toLocaleString('en-US', { maximumFractionDigits: 2 });
 }
 
+function pct(x, digits = 2) {
+  if (!Number.isFinite(x)) return '—';
+  return `${(x * 100).toFixed(digits)}%`;
+}
+
+// Each collateral token has an underlying yield (ONyc is a tokenized real-world
+// credit pool; USDe pays Ethena funding yield). Kamino's own UI gets these from
+// /yields/{mint}/history — hourly snapshots, take the most recent. We mirror
+// that here so our "Max Leverage APY" math uses the same input Kamino displays.
+async function fetchCollateralYields() {
+  const mints = [...new Set(PAIRS.map((p) => p.collTokenMint))];
+  const end = new Date().toISOString();
+  const start = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const pairs = await Promise.all(
+    mints.map(async (mint) => {
+      try {
+        const url = `https://api.kamino.finance/yields/${mint}/history?start=${start}&end=${end}`;
+        const res = await fetch(url, { cf: { cacheTtl: 0, cacheEverything: false } });
+        if (!res.ok) throw new Error(`Kamino yields ${mint}: ${res.status}`);
+        const arr = await res.json();
+        const last = Array.isArray(arr) && arr.length ? arr[arr.length - 1] : null;
+        const apy = last ? Number(last.apy) : NaN;
+        return [mint, Number.isFinite(apy) ? apy : 0];
+      } catch (e) {
+        console.error(`collateral yield fetch failed for ${mint}: ${e.message}`);
+        return [mint, 0];
+      }
+    }),
+  );
+  return Object.fromEntries(pairs);
+}
+
 async function fetchLiquidity(env) {
   // Hit each market's metrics endpoint once, even if multiple pairs use it.
   const markets = [...new Set(PAIRS.map((p) => p.market))];
-  // In parallel: fetch per-market metrics AND on-chain live utilization caps.
-  const [metricsArr, liveCaps] = await Promise.all([
+  // In parallel: per-market metrics, on-chain util caps, per-collateral yields.
+  const [metricsArr, liveCaps, collYields] = await Promise.all([
     Promise.all(
       markets.map(async (m) => {
         const res = await fetch(
@@ -133,12 +192,16 @@ async function fetchLiquidity(env) {
       console.error('on-chain cap fetch failed, using hardcoded fallbacks:', e.message);
       return {};
     }),
+    fetchCollateralYields(),
   ]);
   const reservesByMarket = new Map(metricsArr);
 
   return PAIRS.map((p) => {
-    const r = reservesByMarket.get(p.market).get(p.reserve);
+    const market = reservesByMarket.get(p.market);
+    const r = market.get(p.reserve);
     if (!r) throw new Error(`reserve ${p.reserve} not in market ${p.market}`);
+    const deposit = market.get(p.depositReserve);
+    if (!deposit) throw new Error(`deposit reserve ${p.depositReserve} not in market ${p.market}`);
     // Use live cap when available; fall back to hardcoded if the RPC call failed.
     const utilizationCap = liveCaps[p.reserve] ?? p.utilizationCap;
     const totalSupply = Number(r.totalSupply);
@@ -146,11 +209,38 @@ async function fetchLiquidity(env) {
     const utilization = totalSupply > 0 ? totalBorrow / totalSupply : 0;
     const headroom = Math.max(0, totalSupply * (utilizationCap - utilization));
     const cash = Math.max(0, totalSupply - totalBorrow);
+
+    // APY math — mirrors Kamino UI's "Max Leverage APY":
+    //   maxLeverage     = 1 / (1 - depositMaxLtv)             (base LTV)
+    //   debtRewardApy   = debtRewardWeekly × 52 / totalBorrow (debt-side farm)
+    //   combinedBorrow  = debtBorrowApy − debtRewardApy        (net cost)
+    //   maxApy          = maxLev × collYield − (maxLev − 1) × combinedBorrow
+    // Reward emission rate is hardcoded per pair from the kamino.com tooltip
+    // ("X.XK WEEKLY"). Update PAIRS[i].debtRewardWeekly when Kamino changes it.
+    const depositMaxLtv = Number(deposit.maxLtv) || 0;
+    const collateralYield = collYields[p.collTokenMint] ?? 0;
+    const debtBorrowApy = Number(r.borrowApy) || 0;
+    const debtRewardApy = totalBorrow > 0
+      ? (p.debtRewardWeekly * 52) / totalBorrow
+      : 0;
+    const combinedBorrowApy = Math.max(0, debtBorrowApy - debtRewardApy);
+    const maxLeverage = depositMaxLtv > 0 && depositMaxLtv < 1
+      ? 1 / (1 - depositMaxLtv)
+      : 1;
+    const maxApy = maxLeverage * collateralYield - (maxLeverage - 1) * combinedBorrowApy;
+
     return {
       ...p,
       utilizationCap,         // overrides the hardcoded value with the live one
       utilization,
       available: Math.min(headroom, cash),
+      collateralYield,
+      debtBorrowApy,
+      debtRewardApy,
+      combinedBorrowApy,
+      depositMaxLtv,
+      maxLeverage,
+      maxApy,
     };
   });
 }
@@ -235,6 +325,16 @@ async function formatStatus(env) {
       ? `🟢 <b>depositable: yes</b> (${fmt(s.available)} ${p.symbol})`
       : `🔴 <b>depositable: no</b>  <i>util ${utilStr}% / cap ${capStr}%</i>`;
     lines.push(`  ${p.name}  ${summary}  (${relTime(s.checkedAt)})`);
+    // APY block exists only on snapshots written by post-APY deploys; skip on older.
+    if (s.maxApyPct != null && s.maxLeverage != null) {
+      const borrowStr = (s.debtRewardApyPct ?? 0) > 0
+        ? `borrow ${(s.debtBorrowApyPct ?? 0).toFixed(2)}% − reward ${s.debtRewardApyPct.toFixed(2)}%`
+        : `borrow ${(s.debtBorrowApyPct ?? 0).toFixed(2)}%`;
+      lines.push(
+        `    <i>max-lev APY ${s.maxApyPct.toFixed(2)}% @ ${s.maxLeverage.toFixed(2)}x` +
+          ` · coll ${(s.collateralYieldPct ?? 0).toFixed(2)}% · ${borrowStr}</i>`,
+      );
+    }
   }
   return lines.join('\n');
 }
@@ -268,6 +368,13 @@ function formatTable(data) {
       lines.push(`  🔴 <b>Depositable: no</b>`);
     }
     lines.push(`  <i>util ${utilStr}% / cap ${capStr}%</i>`);
+    const borrowStr = p.debtRewardApy > 0
+      ? `borrow ${pct(p.debtBorrowApy)} − reward ${pct(p.debtRewardApy)} = ${pct(p.combinedBorrowApy)}`
+      : `borrow ${pct(p.debtBorrowApy)}`;
+    lines.push(
+      `  <i>max-lev APY ${pct(p.maxApy)} @ ${p.maxLeverage.toFixed(2)}x` +
+        ` · coll ${pct(p.collateralYield)} · ${borrowStr}</i>`,
+    );
     lines.push('');
   }
   const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
@@ -374,14 +481,25 @@ async function runCron(env, prev) {
       available: p.available,
       utilizationPct: Number((p.utilization * 100).toFixed(2)),
       utilizationCapPct: Number((p.utilizationCap * 100).toFixed(0)),
+      maxApyPct: Number((p.maxApy * 100).toFixed(2)),
+      maxLeverage: Number(p.maxLeverage.toFixed(2)),
+      collateralYieldPct: Number((p.collateralYield * 100).toFixed(2)),
+      debtBorrowApyPct: Number((p.debtBorrowApy * 100).toFixed(2)),
+      debtRewardApyPct: Number((p.debtRewardApy * 100).toFixed(2)),
+      combinedBorrowApyPct: Number((p.combinedBorrowApy * 100).toFixed(2)),
       checkedAt: new Date().toISOString(),
     };
     if (isOpen && !wasOpen) {
+      const rewardStr = p.debtRewardApy > 0
+        ? `, borrow ${pct(p.debtBorrowApy)} − reward ${pct(p.debtRewardApy)}`
+        : `, borrow ${pct(p.debtBorrowApy)}`;
       await broadcast(env, {
         text:
           `🟢 <b>${p.name}</b>\n` +
           `Borrow liquidity is now <b>available</b>: <b>${fmt(p.available)} ${p.symbol}</b>\n` +
           `Utilization: ${(p.utilization * 100).toFixed(2)}%\n` +
+          `Max-lev APY: ${pct(p.maxApy)} @ ${p.maxLeverage.toFixed(2)}x ` +
+          `(coll ${pct(p.collateralYield)}${rewardStr})\n` +
           `<a href="${p.url}">Open position on Kamino</a>`,
         parse_mode: 'HTML',
         disable_web_page_preview: true,

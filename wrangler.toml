@@ -1,6 +1,8 @@
 name = "kamino-liquidity-worker"
 main = "src/index.js"
 compatibility_date = "2025-04-01"
+# Pinned so wrangler doesn't need the Account:Read scope on the API token.
+account_id = "fc836e07034469eb06f5d2d1e1f4a3a6"
 
 # Reliable cron — fires within seconds of schedule, unlike GitHub Actions.
 [triggers]
