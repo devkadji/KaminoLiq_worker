@@ -12,18 +12,17 @@
 // the on-chain reserve config (verified once via klend-sdk); if Kamino changes
 // a cap, update the constant here. Markets are deduplicated when fetching.
 const ONRE_MARKET = '47tfyEG9SsdEnUm9cw5kY9BXngQGqu3LBoop9j5uTAv8';
-const USDE_MARKET = 'BJnbcRHqvppTyGesLzWASGKnmnF1wq9jZu6ExrjT7wvF';
 
 // Each pair needs:
 //   - reserve / depositReserve: borrow + collateral reserves (for util cap, LTV,
 //     borrow APY)
 //   - collTokenMint: identifies the collateral's underlying yield in Kamino's
-//     /yields/{mint}/history endpoint (ONyc tokenizes a real-world credit
-//     pool; USDe pays Ethena funding yield)
+//     /yields/{mint}/history endpoint (ONyc tokenizes a real-world credit pool)
+// utilizationCap fields are FALLBACKS only — the actual cap is fetched on-chain
+// every tick (see fetchLiveUtilizationCaps). The value here is used only if
+// the Solana RPC fetch fails.
 const ONYC_COLL_RESERVE = '6ZxkBSJEqsXA3Kdm2PDAzHLUdPTPUK93Lf4bAezec1UQ';
 const ONYC_MINT = '5Y8NV33Vv7WbnLfq3zBcKSdYPrk7g2KoiQoe7M2tcxp5';
-const USDE_COLL_RESERVE = '2erD9GTGcaQbLsVSQweg3HvMpfKxScmz95raWv8H4iPN';
-const USDE_MINT = 'DEkqHyPN7GMRJ5cArtQFAWefqbZb33Hyf6s5iCwjEonT';
 
 const PAIRS = [
   {
@@ -62,20 +61,6 @@ const PAIRS = [
     utilizationCap: 0.9,
     debtRewardWeekly: 0,
     url: `https://kamino.com/multiply/${ONRE_MARKET}/${ONYC_COLL_RESERVE}/3yDc9ARvtPLhYxZLgucZGuBtZ9bHshBvXTwHxGe3nhmC`,
-  },
-  {
-    name: 'USDe/USDG Multiply',
-    symbol: 'USDG',
-    market: USDE_MARKET,
-    reserve: 'Q5av3wh8j9KCqSjs9njUdsPhrMSKBCUyr4VyUndUUFA',
-    depositReserve: USDE_COLL_RESERVE,
-    collTokenMint: USDE_MINT,
-    // utilizationCap fields are now FALLBACKS only — the actual cap is fetched
-    // on-chain every tick (see fetchLiveUtilizationCaps). The value here is
-    // used only if the Solana RPC fetch fails.
-    utilizationCap: 0.95,
-    debtRewardWeekly: 0,
-    url: `https://kamino.com/multiply/${USDE_MARKET}/${USDE_COLL_RESERVE}/Q5av3wh8j9KCqSjs9njUdsPhrMSKBCUyr4VyUndUUFA`,
   },
 ];
 
@@ -146,9 +131,9 @@ function pct(x, digits = 2) {
 }
 
 // Each collateral token has an underlying yield (ONyc is a tokenized real-world
-// credit pool; USDe pays Ethena funding yield). Kamino's own UI gets these from
-// /yields/{mint}/history — hourly snapshots, take the most recent. We mirror
-// that here so our "Max Leverage APY" math uses the same input Kamino displays.
+// credit pool). Kamino's own UI gets these from /yields/{mint}/history — hourly
+// snapshots, take the most recent. We mirror that here so our "Max Leverage
+// APY" math uses the same input Kamino displays.
 async function fetchCollateralYields() {
   const mints = [...new Set(PAIRS.map((p) => p.collTokenMint))];
   const end = new Date().toISOString();
