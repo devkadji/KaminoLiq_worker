@@ -172,11 +172,48 @@ async function fetchCollateralYields() {
   return Object.fromEntries(pairs);
 }
 
+// Collateral reserves have their own deposit cap (e.g. ONyc currently caps
+// supply at 86.5M tokens; once near full, new multiply positions can't open
+// even when the debt-side borrow cap has headroom). We fetch the cap + decimals
+// from /reserves/{coll}/metrics/history — basic /reserves/metrics doesn't
+// include reserveDepositLimit. One small HTTP per unique collateral reserve.
+async function fetchCollateralCaps() {
+  const seen = new Map();
+  for (const p of PAIRS) {
+    seen.set(p.depositReserve, { market: p.market, reserve: p.depositReserve });
+  }
+  const end = new Date().toISOString();
+  const start = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
+  const out = await Promise.all(
+    [...seen.values()].map(async ({ market, reserve }) => {
+      try {
+        const url = `https://api.kamino.finance/kamino-market/${market}/reserves/${reserve}/metrics/history?start=${start}&end=${end}`;
+        const res = await fetch(url, { cf: { cacheTtl: 0, cacheEverything: false } });
+        if (!res.ok) throw new Error(`coll cap ${reserve}: ${res.status}`);
+        const data = await res.json();
+        const hist = Array.isArray(data?.history) ? data.history : [];
+        const m = hist[hist.length - 1]?.metrics;
+        if (!m) return [reserve, null];
+        const decimals = Number(m.decimals) || 0;
+        // 0 = uncapped in klend; treat as Infinity downstream.
+        const limitRaw = Number(m.reserveDepositLimit || 0);
+        const depositLimit = limitRaw > 0 ? limitRaw / (10 ** decimals) : Infinity;
+        return [reserve, { decimals, depositLimit }];
+      } catch (e) {
+        console.error(`coll cap fetch failed for ${reserve}: ${e.message}`);
+        return [reserve, null];
+      }
+    }),
+  );
+  return Object.fromEntries(out);
+}
+
 async function fetchLiquidity(env) {
   // Hit each market's metrics endpoint once, even if multiple pairs use it.
   const markets = [...new Set(PAIRS.map((p) => p.market))];
-  // In parallel: per-market metrics, on-chain util caps, per-collateral yields.
-  const [metricsArr, liveCaps, collYields] = await Promise.all([
+  // In parallel: per-market metrics, on-chain util caps, per-collateral yields,
+  // per-collateral deposit caps.
+  const [metricsArr, liveCaps, collYields, collCaps] = await Promise.all([
     Promise.all(
       markets.map(async (m) => {
         const res = await fetch(
@@ -193,6 +230,7 @@ async function fetchLiquidity(env) {
       return {};
     }),
     fetchCollateralYields(),
+    fetchCollateralCaps(),
   ]);
   const reservesByMarket = new Map(metricsArr);
 
@@ -229,11 +267,42 @@ async function fetchLiquidity(env) {
       : 1;
     const maxApy = maxLeverage * collateralYield - (maxLeverage - 1) * combinedBorrowApy;
 
+    // Borrow-side headroom (existing math: min of util-cap room and cash).
+    const borrowSideAvailable = Math.min(headroom, cash);
+
+    // Collateral-side headroom translated into equivalent additional debt-
+    // borrow capacity. For a multiply position at leverage L with $E of equity,
+    // the position supplies E×L of collateral (USD) and borrows E×(L-1) of
+    // debt. Inverting: the maximum new debt-borrow allowed by a coll-cap C is
+    // C_usd × (L-1)/L. Since our debt tokens are USD stablecoins (~$1), this
+    // is directly comparable to borrowSideAvailable.
+    const collCap = collCaps[p.depositReserve];
+    const collTotalSupply = Number(deposit.totalSupply);
+    const collTotalSupplyUsd = Number(deposit.totalSupplyUsd);
+    const collPriceUsd = collTotalSupply > 0 ? collTotalSupplyUsd / collTotalSupply : 1;
+    let collHeadroomTokens = Infinity;
+    let collEqAvailable = Infinity;
+    if (collCap && Number.isFinite(collCap.depositLimit)) {
+      collHeadroomTokens = Math.max(0, collCap.depositLimit - collTotalSupply);
+      if (maxLeverage > 1) {
+        collEqAvailable = collHeadroomTokens * collPriceUsd * (maxLeverage - 1) / maxLeverage;
+      }
+    }
+
+    const available = Math.min(borrowSideAvailable, collEqAvailable);
+    // Tag which cap is the binding constraint so the alert can call it out.
+    // Default 'borrow' when both are equal or coll data unavailable.
+    const bindingCap = collEqAvailable < borrowSideAvailable ? 'collateral' : 'borrow';
+
     return {
       ...p,
       utilizationCap,         // overrides the hardcoded value with the live one
       utilization,
-      available: Math.min(headroom, cash),
+      available,
+      borrowSideAvailable,
+      bindingCap,
+      collHeadroomTokens: Number.isFinite(collHeadroomTokens) ? collHeadroomTokens : null,
+      collTokenSymbol: deposit.liquidityToken,
       collateralYield,
       debtBorrowApy,
       debtRewardApy,
@@ -321,9 +390,12 @@ async function formatStatus(env) {
     // Prefer the live on-chain cap stored on the snapshot; fall back to the
     // hardcoded PAIRS value for snapshots written before this field existed.
     const capStr = ((s.utilizationCapPct ?? p.utilizationCap * 100)).toFixed(0);
+    const bindingStr = s.bindingCap === 'collateral'
+      ? `  <i>binding: ${s.collTokenSymbol || 'coll'} supply</i>`
+      : '';
     const summary = s.open
-      ? `🟢 <b>depositable: yes</b> (${fmt(s.available)} ${p.symbol})`
-      : `🔴 <b>depositable: no</b>  <i>util ${utilStr}% / cap ${capStr}%</i>`;
+      ? `🟢 <b>depositable: yes</b> (${fmt(s.available)} ${p.symbol})${bindingStr}`
+      : `🔴 <b>depositable: no</b>  <i>util ${utilStr}% / cap ${capStr}%</i>${bindingStr}`;
     lines.push(`  ${p.name}  ${summary}  (${relTime(s.checkedAt)})`);
     // APY block exists only on snapshots written by post-APY deploys; skip on older.
     if (s.maxApyPct != null && s.maxLeverage != null) {
@@ -362,10 +434,13 @@ function formatTable(data) {
     const utilStr = (p.utilization * 100).toFixed(2);
     const capStr = (p.utilizationCap * 100).toFixed(0);
     lines.push(`<b>${p.name}</b>`);
+    const bindingStr = p.bindingCap === 'collateral'
+      ? ` <i>(binding: ${p.collTokenSymbol || 'coll'} supply${p.collHeadroomTokens != null ? `, ${fmt(p.collHeadroomTokens)} ${p.collTokenSymbol || ''} cap headroom` : ''})</i>`
+      : '';
     if (p.available > 0) {
-      lines.push(`  🟢 <b>Depositable: yes</b> — ${fmt(p.available)} ${p.symbol}`);
+      lines.push(`  🟢 <b>Depositable: yes</b> — ${fmt(p.available)} ${p.symbol}${bindingStr}`);
     } else {
-      lines.push(`  🔴 <b>Depositable: no</b>`);
+      lines.push(`  🔴 <b>Depositable: no</b>${bindingStr}`);
     }
     lines.push(`  <i>util ${utilStr}% / cap ${capStr}%</i>`);
     const borrowStr = p.debtRewardApy > 0
@@ -479,6 +554,10 @@ async function runCron(env, prev) {
     next[p.name] = {
       open: isOpen,
       available: p.available,
+      borrowSideAvailable: p.borrowSideAvailable,
+      bindingCap: p.bindingCap,
+      collHeadroomTokens: p.collHeadroomTokens,
+      collTokenSymbol: p.collTokenSymbol,
       utilizationPct: Number((p.utilization * 100).toFixed(2)),
       utilizationCapPct: Number((p.utilizationCap * 100).toFixed(0)),
       maxApyPct: Number((p.maxApy * 100).toFixed(2)),
@@ -493,10 +572,14 @@ async function runCron(env, prev) {
       const rewardStr = p.debtRewardApy > 0
         ? `, borrow ${pct(p.debtBorrowApy)} − reward ${pct(p.debtRewardApy)}`
         : `, borrow ${pct(p.debtBorrowApy)}`;
+      const bindingLine = p.bindingCap === 'collateral'
+        ? `Binding cap: ${p.collTokenSymbol || 'coll'} supply (${fmt(p.collHeadroomTokens)} ${p.collTokenSymbol || ''} headroom)\n`
+        : '';
       await broadcast(env, {
         text:
           `🟢 <b>${p.name}</b>\n` +
           `Borrow liquidity is now <b>available</b>: <b>${fmt(p.available)} ${p.symbol}</b>\n` +
+          bindingLine +
           `Utilization: ${(p.utilization * 100).toFixed(2)}%\n` +
           `Max-lev APY: ${pct(p.maxApy)} @ ${p.maxLeverage.toFixed(2)}x ` +
           `(coll ${pct(p.collateralYield)}${rewardStr})\n` +
@@ -506,10 +589,13 @@ async function runCron(env, prev) {
         reply_markup: INLINE_KEYBOARD,
       });
     } else if (!isOpen && wasOpen) {
+      const reasonStr = p.bindingCap === 'collateral'
+        ? `${p.collTokenSymbol || 'collateral'} supply at cap`
+        : `utilization ${(p.utilization * 100).toFixed(2)}%`;
       await broadcast(env, {
         text:
           `🔴 <b>${p.name}</b>\n` +
-          `Borrow liquidity is closed again (utilization ${(p.utilization * 100).toFixed(2)}%).`,
+          `Borrow liquidity is closed again (${reasonStr}).`,
         parse_mode: 'HTML',
         reply_markup: INLINE_KEYBOARD,
       });
