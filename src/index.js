@@ -121,6 +121,17 @@ const INLINE_KEYBOARD = {
   inline_keyboard: [[{ text: '📊 Check liquidity', callback_data: 'check' }]],
 };
 
+// Calibration tier monitor (Binance prices).
+//   tier_pct = RATIO_K × p_num / p_den
+// RATIO_K is an opaque precomputed calibration constant. p_num and p_den come
+// from a pair of Binance spot prices. Buckets: green ≥ RATIO_GREEN, yellow ≥
+// RATIO_YELLOW, red below. A broadcast fires once when the bucket transitions
+// into red (not every 5-min tick while it stays red) so subscribers aren't
+// spammed.
+const RATIO_K = 8347.311827956989;
+const RATIO_GREEN = 10.2;
+const RATIO_YELLOW = 10.1;
+
 function fmt(n) {
   return n.toLocaleString('en-US', { maximumFractionDigits: 2 });
 }
@@ -128,6 +139,37 @@ function fmt(n) {
 function pct(x, digits = 2) {
   if (!Number.isFinite(x)) return '—';
   return `${(x * 100).toFixed(digits)}%`;
+}
+
+function ratioBucket(ratioPct) {
+  if (!Number.isFinite(ratioPct)) return null;
+  if (ratioPct >= RATIO_GREEN) return 'green';
+  if (ratioPct >= RATIO_YELLOW) return 'yellow';
+  return 'red';
+}
+
+function ratioEmoji(bucket) {
+  return bucket === 'green' ? '🟢' : bucket === 'yellow' ? '🟡' : bucket === 'red' ? '🔴' : '⚪';
+}
+
+async function fetchBnbNexoRatio() {
+  const url =
+    'https://api.binance.com/api/v3/ticker/price?symbols=%5B%22BNBUSDT%22%2C%22NEXOUSDT%22%5D';
+  const res = await fetch(url, { cf: { cacheTtl: 0, cacheEverything: false } });
+  if (!res.ok) throw new Error(`Binance ${res.status}`);
+  const arr = await res.json();
+  const bnb = Number(arr.find((x) => x.symbol === 'BNBUSDT')?.price);
+  const nexo = Number(arr.find((x) => x.symbol === 'NEXOUSDT')?.price);
+  if (!Number.isFinite(bnb) || !Number.isFinite(nexo) || bnb <= 0) {
+    throw new Error(`Bad Binance payload: BNB=${bnb} NEXO=${nexo}`);
+  }
+  const ratioPct = (RATIO_K * nexo) / bnb;
+  return { bnb, nexo, ratioPct, bucket: ratioBucket(ratioPct) };
+}
+
+function formatRatioLine(r) {
+  if (!r) return '⚪ <b>Current tier:</b> <i>fetch failed</i>';
+  return `${ratioEmoji(r.bucket)} <b>Current tier:</b> ${r.ratioPct.toFixed(2)}%`;
 }
 
 // Each collateral token has an underlying yield (ONyc is a tokenized real-world
@@ -362,9 +404,18 @@ async function formatStatus(env) {
     `Cron schedule:    <code>${cron}</code>`,
     `Subscribers:      ${subs.size} (+ owner)`,
     `Pairs monitored:  ${PAIRS.length}`,
-    '',
-    '<b>Per-pair last seen:</b>',
   ];
+  // Ratio block from the last cron tick (snapshots written by older deploys
+  // won't have this field — skip silently).
+  if (snapshot.ratio && Number.isFinite(snapshot.ratio.ratioPct)) {
+    const r = snapshot.ratio;
+    lines.push(
+      `Current tier:     ${ratioEmoji(r.bucket)} ${r.ratioPct.toFixed(2)}%` +
+        ` (${relTime(r.checkedAt)})`,
+    );
+  }
+  lines.push('');
+  lines.push('<b>Per-pair last seen:</b>');
   for (const p of PAIRS) {
     const s = state[p.name];
     if (!s) {
@@ -413,8 +464,10 @@ function welcomeText() {
   );
 }
 
-function formatTable(data) {
+function formatTable(data, ratio) {
   const lines = ['📊 <b>Borrow Capacity Remaining</b>', ''];
+  lines.push(formatRatioLine(ratio));
+  lines.push('');
   for (const p of data) {
     const utilStr = (p.utilization * 100).toFixed(2);
     const capStr = (p.utilizationCap * 100).toFixed(0);
@@ -511,20 +564,62 @@ async function handleScheduled(env) {
   const snapshot = await loadSnapshot(env);
   const tickRecord = { at: new Date().toISOString(), ok: false };
   let nextPairs = snapshot.pairs || {};
+  let nextRatio = snapshot.ratio || null;
   let caught = null;
   try {
-    nextPairs = await runCron(env, snapshot.pairs || {});
+    // Pairs and ratio fetched in parallel — independent endpoints. A ratio
+    // fetch failure must not abort the pair-check tick (and vice versa).
+    const [pairsResult, ratioResult] = await Promise.allSettled([
+      runCron(env, snapshot.pairs || {}),
+      runRatioCheck(env, snapshot.ratio || null),
+    ]);
+    if (pairsResult.status === 'fulfilled') {
+      nextPairs = pairsResult.value;
+    } else {
+      throw pairsResult.reason;
+    }
+    if (ratioResult.status === 'fulfilled') {
+      nextRatio = ratioResult.value;
+    } else {
+      console.error('ratio check failed:', ratioResult.reason?.message || ratioResult.reason);
+      // Keep prior ratio in the snapshot so /status still shows stale-but-real data.
+    }
     tickRecord.ok = true;
   } catch (err) {
     tickRecord.error = String(err.message || err).slice(0, 200);
     caught = err;
   }
-  // Single write — combines tick heartbeat + per-pair state.
+  // Single write — combines tick heartbeat + per-pair state + ratio state.
   await env.STATE.put(
     'snapshot',
-    JSON.stringify({ tick: tickRecord, pairs: nextPairs }),
+    JSON.stringify({ tick: tickRecord, pairs: nextPairs, ratio: nextRatio }),
   );
   if (caught) throw caught;
+}
+
+// Fetches the calibration tier, broadcasts once on transition INTO red,
+// returns the new snapshot field. Stays mute while already-red (avoids
+// 5-min spam).
+async function runRatioCheck(env, prev) {
+  const r = await fetchBnbNexoRatio();
+  const prevBucket = prev?.bucket ?? null;
+  if (r.bucket === 'red' && prevBucket !== 'red') {
+    await broadcast(env, {
+      text:
+        `🔴 <b>Current tier:</b> ${r.ratioPct.toFixed(2)}%\n` +
+        `Below the ${RATIO_YELLOW}% threshold.`,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      reply_markup: INLINE_KEYBOARD,
+    });
+  }
+  return {
+    bnb: r.bnb,
+    nexo: r.nexo,
+    ratioPct: Number(r.ratioPct.toFixed(4)),
+    bucket: r.bucket,
+    checkedAt: new Date().toISOString(),
+  };
 }
 
 // Pure-ish: takes the previous per-pair state in, returns the new per-pair
@@ -612,13 +707,19 @@ async function handleWebhook(request, env) {
       // Auto-subscribe on first button tap so users don't have to know about /start.
       // Skip for the owner (they always receive alerts; the notice would be misleading).
       const newlySubscribed = chatId !== owner && (await addSubscriber(env, chatId));
-      const data = await fetchLiquidity(env);
+      const [data, ratio] = await Promise.all([
+        fetchLiquidity(env),
+        fetchBnbNexoRatio().catch((e) => {
+          console.error('ratio fetch failed:', e.message);
+          return null;
+        }),
+      ]);
       const prefix = newlySubscribed
         ? "✅ You're now subscribed to alerts (use /stop to unsubscribe).\n\n"
         : '';
       await tg(env, {
         chat_id: chatId,
-        text: prefix + formatTable(data),
+        text: prefix + formatTable(data, ratio),
         parse_mode: 'HTML',
         disable_web_page_preview: true,
         reply_markup: INLINE_KEYBOARD,
@@ -635,7 +736,13 @@ async function handleWebhook(request, env) {
 
     if (text === '/start') {
       const added = await addSubscriber(env, chatId);
-      const data = await fetchLiquidity(env);
+      const [data, ratio] = await Promise.all([
+        fetchLiquidity(env),
+        fetchBnbNexoRatio().catch((e) => {
+          console.error('ratio fetch failed:', e.message);
+          return null;
+        }),
+      ]);
       const isOwner = chatId === owner;
       const subscribeNote = isOwner
         ? '<i>(you are the bot owner — you always receive alerts)</i>\n\n'
@@ -644,16 +751,22 @@ async function handleWebhook(request, env) {
           : '<i>(already subscribed)</i>\n\n';
       await tg(env, {
         chat_id: chatId,
-        text: welcomeText() + subscribeNote + formatTable(data),
+        text: welcomeText() + subscribeNote + formatTable(data, ratio),
         parse_mode: 'HTML',
         disable_web_page_preview: true,
         reply_markup: INLINE_KEYBOARD,
       });
     } else if (text === '/check') {
-      const data = await fetchLiquidity(env);
+      const [data, ratio] = await Promise.all([
+        fetchLiquidity(env),
+        fetchBnbNexoRatio().catch((e) => {
+          console.error('ratio fetch failed:', e.message);
+          return null;
+        }),
+      ]);
       await tg(env, {
         chat_id: chatId,
-        text: formatTable(data),
+        text: formatTable(data, ratio),
         parse_mode: 'HTML',
         disable_web_page_preview: true,
         reply_markup: INLINE_KEYBOARD,
