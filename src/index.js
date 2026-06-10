@@ -153,15 +153,19 @@ function ratioEmoji(bucket) {
 }
 
 async function fetchBnbNexoRatio() {
+  // CoinGecko: reliable from CF Workers (Binance's API geo-blocks many CF
+  // datacenter IPs with 451/418 responses). Free tier is 30 req/min — well
+  // above our 5-min cron cadence. Data refreshes ~once per minute server-side,
+  // which matches our reporting granularity.
   const url =
-    'https://api.binance.com/api/v3/ticker/price?symbols=%5B%22BNBUSDT%22%2C%22NEXOUSDT%22%5D';
+    'https://api.coingecko.com/api/v3/simple/price?ids=binancecoin,nexo&vs_currencies=usd';
   const res = await fetch(url, { cf: { cacheTtl: 0, cacheEverything: false } });
-  if (!res.ok) throw new Error(`Binance ${res.status}`);
-  const arr = await res.json();
-  const bnb = Number(arr.find((x) => x.symbol === 'BNBUSDT')?.price);
-  const nexo = Number(arr.find((x) => x.symbol === 'NEXOUSDT')?.price);
+  if (!res.ok) throw new Error(`Price API ${res.status}`);
+  const obj = await res.json();
+  const bnb = Number(obj?.binancecoin?.usd);
+  const nexo = Number(obj?.nexo?.usd);
   if (!Number.isFinite(bnb) || !Number.isFinite(nexo) || bnb <= 0) {
-    throw new Error(`Bad Binance payload: BNB=${bnb} NEXO=${nexo}`);
+    throw new Error(`Bad price payload: ${JSON.stringify(obj).slice(0, 80)}`);
   }
   const ratioPct = (RATIO_K * nexo) / bnb;
   return { bnb, nexo, ratioPct, bucket: ratioBucket(ratioPct) };
