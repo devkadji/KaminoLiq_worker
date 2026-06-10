@@ -153,17 +153,16 @@ function ratioEmoji(bucket) {
 }
 
 async function fetchBnbNexoRatio() {
-  // CoinGecko: reliable from CF Workers (Binance's API geo-blocks many CF
-  // datacenter IPs with 451/418 responses). Free tier is 30 req/min — well
-  // above our 5-min cron cadence. Data refreshes ~once per minute server-side,
-  // which matches our reporting granularity.
+  // DefiLlama coins API: edge-friendly, no auth, both prices in one call.
+  // Binance (451/418) and CoinGecko's free public endpoint (403) both block
+  // many CF datacenter IPs. DefiLlama is purpose-built for serverless/edge.
   const url =
-    'https://api.coingecko.com/api/v3/simple/price?ids=binancecoin,nexo&vs_currencies=usd';
+    'https://coins.llama.fi/prices/current/coingecko:binancecoin,coingecko:nexo';
   const res = await fetch(url, { cf: { cacheTtl: 0, cacheEverything: false } });
   if (!res.ok) throw new Error(`Price API ${res.status}`);
   const obj = await res.json();
-  const bnb = Number(obj?.binancecoin?.usd);
-  const nexo = Number(obj?.nexo?.usd);
+  const bnb = Number(obj?.coins?.['coingecko:binancecoin']?.price);
+  const nexo = Number(obj?.coins?.['coingecko:nexo']?.price);
   if (!Number.isFinite(bnb) || !Number.isFinite(nexo) || bnb <= 0) {
     throw new Error(`Bad price payload: ${JSON.stringify(obj).slice(0, 80)}`);
   }
