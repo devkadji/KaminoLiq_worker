@@ -238,12 +238,69 @@ async function fetchCollateralCaps() {
   return Object.fromEntries(out);
 }
 
+// --- Borrow rate from the on-chain curve ---
+// Kamino's /reserves/metrics `borrowApy` is systematically inflated: as of
+// 2026-08-31 it reads ~1.58x (in APR terms) the rate the on-chain borrow
+// curve gives at the reserve's live utilization, for every ONRE debt reserve
+// (USDG 14.96% vs 9.25%, USDC 12.23% vs 7.59%). The kamino.com UI's
+// "Max Leverage APY" matches the curve value, so using the metrics field made
+// our number ~10 points too low. We therefore compute the borrow APY
+// ourselves: interpolate the reserve's borrowCurve (from metrics/history,
+// where it's exposed) at the live utilization from /reserves/metrics, then
+// APR -> APY via continuous compounding (klend compounds per slot).
+function borrowApyFromCurve(curve, utilization) {
+  if (!Array.isArray(curve) || curve.length < 2) return null;
+  const pts = curve
+    .map(([x, y]) => [Number(x), Number(y)])
+    .filter(([x, y]) => Number.isFinite(x) && Number.isFinite(y))
+    .sort((a, b) => a[0] - b[0]);
+  if (pts.length < 2) return null;
+  const u = Math.min(Math.max(utilization, pts[0][0]), pts[pts.length - 1][0]);
+  for (let i = 1; i < pts.length; i++) {
+    const [x0, y0] = pts[i - 1];
+    const [x1, y1] = pts[i];
+    if (u <= x1 || i === pts.length - 1) {
+      const apr = x1 > x0 ? y0 + ((y1 - y0) * (u - x0)) / (x1 - x0) : y1;
+      return Math.expm1(apr);
+    }
+  }
+  return null;
+}
+
+// One metrics/history call per debt reserve (the basic /reserves/metrics
+// doesn't expose borrowCurve). The curve changes only when Kamino retunes a
+// reserve, so a fetch failure just means we fall back to the (inflated)
+// metrics borrowApy for that tick — logged, never fatal.
+async function fetchDebtCurves() {
+  const seen = new Map();
+  for (const p of PAIRS) seen.set(p.reserve, p.market);
+  const end = new Date().toISOString();
+  const start = new Date(Date.now() - 3 * 3600 * 1000).toISOString();
+  const out = await Promise.all(
+    [...seen.entries()].map(async ([reserve, market]) => {
+      try {
+        const url = `https://api.kamino.finance/kamino-market/${market}/reserves/${reserve}/metrics/history?start=${start}&end=${end}`;
+        const res = await fetch(url, { cf: { cacheTtl: 0, cacheEverything: false } });
+        if (!res.ok) throw new Error(`debt curve ${reserve}: ${res.status}`);
+        const data = await res.json();
+        const hist = Array.isArray(data?.history) ? data.history : [];
+        const m = hist[hist.length - 1]?.metrics;
+        return [reserve, m?.borrowCurve || null];
+      } catch (e) {
+        console.error(`debt curve fetch failed for ${reserve}: ${e.message}`);
+        return [reserve, null];
+      }
+    }),
+  );
+  return Object.fromEntries(out);
+}
+
 async function fetchLiquidity(env) {
   // Hit each market's metrics endpoint once, even if multiple pairs use it.
   const markets = [...new Set(PAIRS.map((p) => p.market))];
   // In parallel: per-market metrics, on-chain util caps, per-collateral yields,
   // per-collateral deposit caps.
-  const [metricsArr, liveCaps, collYields, collCaps] = await Promise.all([
+  const [metricsArr, liveCaps, collYields, collCaps, debtCurves] = await Promise.all([
     Promise.all(
       markets.map(async (m) => {
         const res = await fetch(
@@ -261,6 +318,7 @@ async function fetchLiquidity(env) {
     }),
     fetchCollateralYields(),
     fetchCollateralCaps(),
+    fetchDebtCurves(),
   ]);
   const reservesByMarket = new Map(metricsArr);
 
@@ -287,7 +345,10 @@ async function fetchLiquidity(env) {
     // ("X.XK WEEKLY"). Update PAIRS[i].debtRewardWeekly when Kamino changes it.
     const depositMaxLtv = Number(deposit.maxLtv) || 0;
     const collateralYield = collYields[p.collTokenMint] ?? 0;
-    const debtBorrowApy = Number(r.borrowApy) || 0;
+    // Curve-derived borrow APY (see borrowApyFromCurve). The raw metrics
+    // borrowApy is only the fallback when the curve fetch failed.
+    const curveApy = borrowApyFromCurve(debtCurves[p.reserve], utilization);
+    const debtBorrowApy = curveApy ?? (Number(r.borrowApy) || 0);
     const debtRewardApy = totalBorrow > 0
       ? (p.debtRewardWeekly * 52) / totalBorrow
       : 0;
