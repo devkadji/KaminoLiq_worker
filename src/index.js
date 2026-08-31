@@ -560,6 +560,28 @@ async function broadcast(env, payload) {
   }
 }
 
+// Dead-man's-switch heartbeat. Cloudflare can silently stop invoking a Worker's
+// cron trigger while leaving the schedule registered (observed 2026-07-19: the
+// */5 schedule stalled for ~33h with no error). A watchdog INSIDE this worker
+// can't detect its own non-execution, so we ping an EXTERNAL monitor
+// (healthchecks.io / cron-job.org / betterstack) on every tick. When the pings
+// stop, that monitor alerts — catching a stalled cron in minutes, not days.
+//
+// Set the ping URL as a secret:  wrangler secret put HEARTBEAT_URL
+// No-ops if unset, so the worker runs fine without it. Never throws — a
+// monitoring failure must not affect the actual liquidity check.
+async function pingHeartbeat(env, ok) {
+  const base = env && env.HEARTBEAT_URL;
+  if (!base) return;
+  // healthchecks.io convention: POST <url> on success, <url>/fail on failure.
+  const url = ok ? base : `${base.replace(/\/$/, '')}/fail`;
+  try {
+    await fetch(url, { method: 'POST' });
+  } catch (err) {
+    console.error('heartbeat ping failed (non-fatal):', err.message);
+  }
+}
+
 async function handleScheduled(env) {
   // Load previous snapshot (pairs + last tick) in one read. We'll write the
   // updated combined snapshot ONCE at the end — saves 1 KV write per tick
@@ -597,6 +619,10 @@ async function handleScheduled(env) {
     'snapshot',
     JSON.stringify({ tick: tickRecord, pairs: nextPairs, ratio: nextRatio }),
   );
+  // External dead-man's switch — fires whether or not the tick succeeded so a
+  // repeatedly-failing cron is caught too (via the /fail path). Awaited but
+  // non-fatal (pingHeartbeat swallows its own errors).
+  await pingHeartbeat(env, tickRecord.ok);
   if (caught) throw caught;
 }
 
