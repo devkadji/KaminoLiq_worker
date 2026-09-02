@@ -32,7 +32,7 @@ const PAIRS = [
     reserve: 'JBmLCoKqjdKSStK45onRqe6U6sxVgSpdXoeXe4h7NwJw',
     depositReserve: ONYC_COLL_RESERVE,
     collTokenMint: ONYC_MINT,
-    utilizationCap: 0.9,
+    utilizationCap: 0.95,      // on-chain value 2026-08-31 (USDC/USDS are 0.90)
     // Debt-side reward emitted to USDG borrowers, in USDG/week. Verified on
     // kamino.com tooltip "X.XK WEEKLY" — read off the page; update if Kamino
     // adjusts emissions. Effective APY = weeklyAmount × 52 / debtTotalBorrow,
@@ -70,11 +70,16 @@ const PAIRS = [
 // Kamino UI shows. To stay in sync, we read the actual cap directly from each
 // reserve account via Solana RPC with a `dataSlice` (one byte per reserve, ~4
 // bytes total per tick — much lighter than running the klend-sdk in a worker).
-// Default RPC: api.mainnet-beta.solana.com blocks Cloudflare Workers' egress
-// IPs with HTTP 403, so we use Allnodes' publicnode (no key, supports
-// `dataSlice`, accepts requests from CF). Override via the SOLANA_RPC secret
-// if you want to point at Helius/another provider.
-const DEFAULT_SOLANA_RPC = 'https://solana-rpc.publicnode.com';
+// RPC endpoints are tried in order (SOLANA_RPC secret first, if set). No
+// free keyless endpoint is reliable from Cloudflare's egress IPs long-term:
+// api.mainnet-beta 403'd us in 2026-05, publicnode started 429ing 2026-08-31.
+// So: try each, and when ALL fail fall back to the last cap values that ever
+// succeeded (cached in KV — caps change rarely, so stale-but-verified beats
+// a constant), then to the hardcoded PAIRS values as the final floor.
+const SOLANA_RPCS = [
+  'https://solana-rpc.publicnode.com',
+  'https://api.mainnet-beta.solana.com',
+];
 // Byte offset of `config.utilizationLimitBlockBorrowingAbovePct` (a u8 percent
 // value 0..100) within Kamino's Reserve account data. Verified empirically by
 // intersecting offsets where multiple reserves' values match across 4
@@ -82,8 +87,7 @@ const DEFAULT_SOLANA_RPC = 'https://solana-rpc.publicnode.com';
 // the Reserve account in a program upgrade.
 const UTIL_CAP_OFFSET = 5501;
 
-async function fetchLiveUtilizationCaps(env) {
-  const rpcUrl = (env && env.SOLANA_RPC) || DEFAULT_SOLANA_RPC;
+async function queryCapsFromRpc(rpcUrl) {
   const addrs = PAIRS.map((p) => p.reserve);
   const body = {
     jsonrpc: '2.0',
@@ -114,7 +118,44 @@ async function fetchLiveUtilizationCaps(env) {
       out[addrs[i]] = byte / 100;
     }
   }
+  if (!Object.keys(out).length) throw new Error(`Solana RPC: empty result (${rpcUrl})`);
   return out;
+}
+
+async function fetchLiveUtilizationCaps(env) {
+  const rpcs = [env && env.SOLANA_RPC, ...SOLANA_RPCS].filter(Boolean);
+  let lastErr = new Error('no RPC endpoints configured');
+  for (const rpcUrl of rpcs) {
+    try {
+      const caps = await queryCapsFromRpc(rpcUrl);
+      // Remember the verified values so future RPC outages degrade to
+      // last-known-good instead of the hardcoded constants. Write only on
+      // change — caps move rarely, and KV free tier allows 1000 writes/day.
+      if (env && env.STATE) {
+        try {
+          const prev = await env.STATE.get('utilCaps', 'json');
+          if (JSON.stringify(prev?.caps) !== JSON.stringify(caps)) {
+            await env.STATE.put('utilCaps', JSON.stringify({ caps, at: new Date().toISOString() }));
+          }
+        } catch (e) {
+          console.error('utilCaps KV cache write failed (non-fatal):', e.message);
+        }
+      }
+      return caps;
+    } catch (e) {
+      lastErr = e;
+      console.error(`cap fetch via ${rpcUrl} failed: ${e.message}`);
+    }
+  }
+  // Every RPC failed — serve the last values a successful read returned.
+  if (env && env.STATE) {
+    const cached = await env.STATE.get('utilCaps', 'json').catch(() => null);
+    if (cached && cached.caps && Object.keys(cached.caps).length) {
+      console.error(`all RPCs failed, using KV-cached caps from ${cached.at}`);
+      return cached.caps;
+    }
+  }
+  throw lastErr;
 }
 
 const INLINE_KEYBOARD = {
