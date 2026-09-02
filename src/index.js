@@ -169,7 +169,7 @@ const INLINE_KEYBOARD = {
 // RATIO_YELLOW, red below. A broadcast fires once when the bucket transitions
 // into red (not every 5-min tick while it stays red) so subscribers aren't
 // spammed.
-const RATIO_K = 10821.935483870968;
+const RATIO_K = 8817.20430107527;
 const RATIO_GREEN = 10.2;
 const RATIO_YELLOW = 10.1;
 
