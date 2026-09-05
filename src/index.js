@@ -169,9 +169,35 @@ const INLINE_KEYBOARD = {
 // RATIO_YELLOW, red below. A broadcast fires once when the bucket transitions
 // into red (not every 5-min tick while it stays red) so subscribers aren't
 // spammed.
-const RATIO_K = 9139.78494623656;
+// Default calibration constant, used when no runtime override is stored in KV.
+// The live value is normally set by the owner via /setratio (kept in KV so
+// recalibrations don't require a code push). This default is the fallback for
+// a fresh worker / failed KV read, and the floor if a stored value is invalid.
+const DEFAULT_RATIO_K = 9139.78494623656;
+// Sanity band for an accepted RATIO_K (rejects negatives, zero, and obvious
+// fat-fingers). The tier % the owner sees in the /setratio confirmation is the
+// real guard against a plausible-but-wrong value.
+const RATIO_K_MIN = 1;
+const RATIO_K_MAX = 1_000_000;
 const RATIO_GREEN = 10.2;
 const RATIO_YELLOW = 10.1;
+
+// Runtime override for RATIO_K, stored in KV (key `ratioConfig`). Global by
+// nature — one value drives the single tier shown/broadcast to every
+// subscriber, matching the bot's existing single-position semantics. Returns
+// the effective K plus where it came from (for /status).
+async function getRatioConfig(env) {
+  try {
+    const cfg = await env.STATE.get('ratioConfig', 'json');
+    const k = Number(cfg?.k);
+    if (Number.isFinite(k) && k >= RATIO_K_MIN && k <= RATIO_K_MAX) {
+      return { k, source: 'override', setBy: cfg.setBy ?? null, at: cfg.at ?? null };
+    }
+  } catch (e) {
+    console.error('ratioConfig read failed, using default:', e.message);
+  }
+  return { k: DEFAULT_RATIO_K, source: 'default', setBy: null, at: null };
+}
 
 function fmt(n) {
   return n.toLocaleString('en-US', { maximumFractionDigits: 2 });
@@ -193,7 +219,7 @@ function ratioEmoji(bucket) {
   return bucket === 'green' ? '🟢' : bucket === 'yellow' ? '🟡' : bucket === 'red' ? '🔴' : '⚪';
 }
 
-async function fetchBnbNexoRatio() {
+async function fetchBnbNexoRatio(env) {
   // DefiLlama coins API: edge-friendly, no auth, both prices in one call.
   // Binance (451/418) and CoinGecko's free public endpoint (403) both block
   // many CF datacenter IPs. DefiLlama is purpose-built for serverless/edge.
@@ -207,7 +233,8 @@ async function fetchBnbNexoRatio() {
   if (!Number.isFinite(bnb) || !Number.isFinite(nexo) || bnb <= 0) {
     throw new Error(`Bad price payload: ${JSON.stringify(obj).slice(0, 80)}`);
   }
-  const ratioPct = (RATIO_K * nexo) / bnb;
+  const { k: ratioK } = await getRatioConfig(env);
+  const ratioPct = (ratioK * nexo) / bnb;
   return { bnb, nexo, ratioPct, bucket: ratioBucket(ratioPct) };
 }
 
@@ -519,6 +546,11 @@ async function formatStatus(env) {
         ` (${relTime(r.checkedAt)})`,
     );
   }
+  // Effective calibration constant + where it came from (override vs default).
+  const rk = await getRatioConfig(env);
+  lines.push(
+    `RATIO_K:          ${rk.k} (${rk.source}${rk.at ? `, set ${relTime(rk.at)}` : ''})`,
+  );
   lines.push('');
   lines.push('<b>Per-pair last seen:</b>');
   for (const p of PAIRS) {
@@ -732,7 +764,7 @@ async function handleScheduled(env) {
 // returns the new snapshot field. Stays mute while already-red (avoids
 // 5-min spam).
 async function runRatioCheck(env, prev) {
-  const r = await fetchBnbNexoRatio();
+  const r = await fetchBnbNexoRatio(env);
   const prevBucket = prev?.bucket ?? null;
   if (r.bucket === 'red' && prevBucket !== 'red') {
     await broadcast(env, {
@@ -840,7 +872,7 @@ async function handleWebhook(request, env) {
       const newlySubscribed = chatId !== owner && (await addSubscriber(env, chatId));
       const [data, ratio] = await Promise.all([
         fetchLiquidity(env),
-        fetchBnbNexoRatio().catch((e) => {
+        fetchBnbNexoRatio(env).catch((e) => {
           console.error('ratio fetch failed:', e.message);
           return null;
         }),
@@ -869,7 +901,7 @@ async function handleWebhook(request, env) {
       const added = await addSubscriber(env, chatId);
       const [data, ratio] = await Promise.all([
         fetchLiquidity(env),
-        fetchBnbNexoRatio().catch((e) => {
+        fetchBnbNexoRatio(env).catch((e) => {
           console.error('ratio fetch failed:', e.message);
           return null;
         }),
@@ -890,7 +922,7 @@ async function handleWebhook(request, env) {
     } else if (text === '/check') {
       const [data, ratio] = await Promise.all([
         fetchLiquidity(env),
-        fetchBnbNexoRatio().catch((e) => {
+        fetchBnbNexoRatio(env).catch((e) => {
           console.error('ratio fetch failed:', e.message);
           return null;
         }),
@@ -919,6 +951,55 @@ async function handleWebhook(request, env) {
         text: await formatStatus(env),
         parse_mode: 'HTML',
         disable_web_page_preview: true,
+      });
+    } else if (text.startsWith('/setratio') && chatId === owner) {
+      // Owner-only: set the calibration constant at runtime (stored in KV, no
+      // redeploy). The owner does the NEXO/BNB math off-bot and enters only the
+      // opaque K, so no balance ever transits the bot. Gated by chatId === owner
+      // in the condition, so a non-owner's /setratio falls through to the
+      // unknown-command help and never learns the command exists.
+      const arg = text.split(/\s+/)[1];
+      const k = Number(arg);
+      if (!arg) {
+        const cur = await getRatioConfig(env);
+        await tg(env, {
+          chat_id: chatId,
+          text:
+            `Usage: <code>/setratio &lt;value&gt;</code>\n` +
+            `Current: <b>${cur.k}</b> (${cur.source})` +
+            (cur.at ? `, set ${relTime(cur.at)}` : ''),
+          parse_mode: 'HTML',
+        });
+      } else if (!Number.isFinite(k) || k < RATIO_K_MIN || k > RATIO_K_MAX) {
+        await tg(env, {
+          chat_id: chatId,
+          text: `❌ Rejected "${arg}". RATIO_K must be a number in [${RATIO_K_MIN}, ${RATIO_K_MAX}].`,
+        });
+      } else {
+        const prev = await getRatioConfig(env);
+        await env.STATE.put(
+          'ratioConfig',
+          JSON.stringify({ k, setBy: chatId, at: new Date().toISOString(), prev: prev.k }),
+        );
+        // Echo the resulting tier so a plausible-but-wrong K is caught by eye.
+        const r = await fetchBnbNexoRatio(env).catch(() => null);
+        const tierLine = r
+          ? `\nTier now: ${ratioEmoji(r.bucket)} <b>${r.ratioPct.toFixed(2)}%</b> (at current prices)`
+          : '';
+        await tg(env, {
+          chat_id: chatId,
+          text:
+            `✅ RATIO_K set to <b>${k}</b> (was ${prev.k}${prev.source === 'default' ? ', default' : ''}).` +
+            `${tierLine}\nEffective from the next cron tick (≤5 min).`,
+          parse_mode: 'HTML',
+        });
+      }
+    } else if (text === '/resetratio' && chatId === owner) {
+      await env.STATE.delete('ratioConfig');
+      await tg(env, {
+        chat_id: chatId,
+        text: `↩️ Override cleared. RATIO_K falls back to the code default (<b>${DEFAULT_RATIO_K}</b>).`,
+        parse_mode: 'HTML',
       });
     } else if (text === '/who' && chatId === owner) {
       const subs = await getSubscribers(env);
